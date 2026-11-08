@@ -1,0 +1,2416 @@
+<roblox version="4">
+  <Item class="Folder" referent="RBX0001">
+    <Properties>
+      <string name="Name">SmartAC</string>
+    </Properties>
+    <Item class="Folder" referent="RBX0002">
+      <Properties>
+        <string name="Name">Modules</string>
+      </Properties>
+      <Item class="Folder" referent="RBX0003">
+        <Properties>
+          <string name="Name">Cmd</string>
+        </Properties>
+        <Item class="ModuleScript" referent="RBX0004">
+          <Properties>
+            <string name="Name">Defs</string>
+            <ProtectedString name="Source"><![CDATA[-- Daftar perintah (gaya Kohl's: ;perintah argumen...). Setiap perintah dijalankan SETELAH server memeriksa izin
+-- (Permissions) dan memvalidasi argumen (Process). Perintah "merugikan" tidak menyentuh diri sendiri / staf setara atau lebih tinggi.
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local Config = require(script.Parent.Parent.Parent.Config)
+local Bridge = require(script.Parent.Parent.Bridge)
+local Executor = require(script.Parent.Parent.Executor)
+local Exemptions = require(script.Parent.Parent.Exemptions)
+local Integration = require(script.Parent.Parent.Integration)
+local Permissions = require(script.Parent.Parent.Permissions)
+local Remotes = require(script.Parent.Parent.Remotes)
+
+local Defs = {}
+local GRACE = Config.AntiCheat.Grace.Teleport
+local DEFAULT_WALK, DEFAULT_JUMP = 16, 50
+
+-- ---------- helper ----------
+local function root(p) local c = p.Character return c and c:FindFirstChild("HumanoidRootPart") end
+local function hum(p) local c = p.Character return c and c:FindFirstChildOfClass("Humanoid") end
+
+local function harmful(ctx, list, allowSelf)
+	local ok, skipped = {}, 0
+	for _, p in ipairs(list) do
+		if (allowSelf and p == ctx.player) or Permissions.CanTargetId(ctx.player, p.UserId) then table.insert(ok, p) else skipped += 1 end
+	end
+	return ok, skipped
+end
+
+local function names(list)
+	local t = {}
+	for i, p in ipairs(list) do if i <= 5 then t[i] = p.Name end end
+	local s = table.concat(t, ", ")
+	return #list > 5 and (s .. (" +%d lainnya"):format(#list - 5)) or s
+end
+
+local function summarize(verb, list, skipped)
+	if #list == 0 then return false, "Tidak ada target yang boleh ditindak" .. (skipped > 0 and " (staf setara/lebih tinggi dilindungi)." or ".") end
+	local msg = ("%s: %s"):format(verb, names(list))
+	if skipped > 0 then msg ..= (" (%d dilewati: dilindungi)"):format(skipped) end
+	return true, msg
+end
+
+local function record(admin, kind, target, reason)
+	local role = Permissions.RoleOf(admin)
+	if not role or not Bridge.Enabled then return end
+	local userId = target.UserId
+	task.spawn(function()
+		Bridge.Call("record_action", {
+			actor_user_id = admin.UserId, role_key = role, target_user_id = userId, action_type = kind,
+			reason = reason:sub(1, 400), idempotency_key = HttpService:GenerateGUID(false),
+		})
+	end)
+end
+
+local function requestAction(ctx, kind, target, duration, reason)
+	if not Bridge.Enabled then return false, "Backend belum dikonfigurasi (Config.Backend). Ban/unban butuh backend." end
+	if kind == "ban" and not Permissions.CanTargetId(ctx.player, target.userId) then
+		return false, "Target adalah staf setara/lebih tinggi (atau diri sendiri)."
+	end
+	if kind == "ban" then
+		local cap = Permissions.MaxBanSeconds(ctx.role)
+		if cap and (duration.permanent or duration.seconds > cap) then
+			return false, ("Role %s hanya boleh ban sampai %d hari."):format(ctx.role, math.floor(cap / 86400))
+		end
+	end
+	local ok, res = Bridge.Call("request_action", {
+		actor_user_id = ctx.player.UserId, role_key = ctx.role, target_user_id = target.userId, action_type = kind,
+		duration_seconds = duration and duration.seconds or nil, permanent = duration and duration.permanent == true or false,
+		public_reason = reason, private_reason = ("In-game ;%s oleh %s"):format(kind, ctx.player.Name),
+		idempotency_key = HttpService:GenerateGUID(false),
+	})
+	if not ok then return false, "Ditolak backend: " .. tostring(res) end
+	if res.status == "pending_approval" then
+		return true, ("Ban PERMANEN %s dicatat, MENUNGGU persetujuan Management/Founder (orang lain)."):format(target.name)
+	end
+	return true, ("%s %s diantrekan. Dieksekusi server game dalam ±5–10 detik."):format(kind, target.name)
+end
+
+local function setInvisible(char, on)
+	for _, d in ipairs(char:GetDescendants()) do
+		if (d:IsA("BasePart") and d.Name ~= "HumanoidRootPart") or d:IsA("Decal") then
+			if on then
+				if d:GetAttribute("SmartACOrigT") == nil then d:SetAttribute("SmartACOrigT", d.Transparency) end
+				d.Transparency = 1
+			else
+				local o = d:GetAttribute("SmartACOrigT")
+				if o ~= nil then d.Transparency = o d:SetAttribute("SmartACOrigT", nil) end
+			end
+		end
+	end
+end
+
+local function applyDescription(player, userId)
+	local h = hum(player)
+	if not h then return false, "Karakter tidak tersedia." end
+	local ok, desc = pcall(function() return Players:GetHumanoidDescriptionFromUserIdAsync(userId) end)
+	if not ok then ok, desc = pcall(function() return Players:GetHumanoidDescriptionFromUserId(userId) end) end
+	if not ok or not desc then return false, "Avatar tidak bisa diambil." end
+	local applied = pcall(function() h:ApplyDescription(desc) end)
+	return applied, applied and "Avatar diterapkan." or "Gagal menerapkan avatar."
+end
+
+-- ---------- registrasi ----------
+function Defs.Register(R, env)
+	local add = R.Add
+	local lastPos = {}          -- posisi sebelum teleport (untuk ;back)
+	local locked = false        -- ;slock
+	local pendingShutdown = {}  -- konfirmasi 2 langkah
+
+	Players.PlayerRemoving:Connect(function(p) lastPos[p.UserId] = nil pendingShutdown[p.UserId] = nil end)
+	Players.PlayerAdded:Connect(function(p)
+		if locked and not Permissions.IsStaff(p) then p:Kick("Server sedang dikunci oleh staf. Coba lagi nanti atau masuk server lain.") end
+	end)
+	local function remember(p) local r = root(p) if r then lastPos[p.UserId] = r.CFrame end end
+	local function move(p, cf, why)
+		local r = root(p)
+		if not r then return false end
+		remember(p)
+		Exemptions.Grant(p, GRACE, why)
+		r.CFrame = cf
+		return true
+	end
+
+	-- ===== UTILITAS =====
+	add({ name = "help", aliases = { "cmds", "commands" }, group = "utility", desc = "Daftar perintah yang bisa lu pakai", run = function(ctx)
+		local byGroup, order = {}, {}
+		for _, d in ipairs(R.All()) do
+			if env.canUse(ctx, d) then
+				if not byGroup[d.group] then byGroup[d.group] = {} table.insert(order, d.group) end
+				table.insert(byGroup[d.group], d.name)
+			end
+		end
+		local lines = { "Awalan ; — contoh: ;kick budi spam | selector: me, all, others, random, admins, nonadmins, nama" }
+		for _, g in ipairs(order) do table.insert(lines, ("[%s] %s"):format(g, table.concat(byGroup[g], ", "))) end
+		return true, table.concat(lines, "\n")
+	end })
+
+	add({ name = "players", aliases = { "plrs" }, group = "utility", desc = "Daftar pemain di server ini", run = function()
+		local t = {}
+		for _, p in ipairs(Players:GetPlayers()) do table.insert(t, p.Name .. (Permissions.RoleOf(p) and (" [" .. Permissions.RoleOf(p) .. "]") or "")) end
+		return true, ("%d pemain: %s"):format(#t, table.concat(t, ", "))
+	end })
+
+	add({ name = "staff", group = "utility", desc = "Staf yang sedang online", run = function()
+		local t = {}
+		for _, p in ipairs(Players:GetPlayers()) do local r = Permissions.RoleOf(p) if r then table.insert(t, ("%s [%s]"):format(p.Name, r)) end end
+		return true, #t > 0 and table.concat(t, ", ") or "Tidak ada staf online di server ini."
+	end })
+
+	add({ name = "whoami", aliases = { "myrole" }, group = "utility", desc = "Role & izin lu", run = function(ctx)
+		return true, ("Role: %s (rank %d) · %s"):format(ctx.role, ctx.rank, ctx.role == "helper" and "izin: warn, kick, ban 1 hari, announce server, uang/status (dibatasi)" or "akses penuh di Roblox")
+	end })
+
+	add({ name = "serverinfo", aliases = { "sinfo" }, group = "utility", desc = "Info server ini", run = function()
+		local staff = 0
+		for _, p in ipairs(Players:GetPlayers()) do if Permissions.IsStaff(p) then staff += 1 end end
+		return true, ("Pemain %d/%d · staf %d · uptime %d menit · versi %d · %s · backend: %s%s"):format(
+			#Players:GetPlayers(), Players.MaxPlayers, staff, math.floor(workspace.DistributedGameTime / 60), game.PlaceVersion,
+			Bridge.JobId:sub(1, 8), Bridge.Enabled and "ON" or "OFF", locked and " · DIKUNCI" or "")
+	end })
+
+	add({ name = "info", group = "utility", perm = "players.read", desc = "Info pemain", args = { { name = "pemain", type = "player" } },
+		run = function(_, p)
+			return true, ("%s (@%s) · UserId %d · umur akun %d hari · role: %s"):format(p.DisplayName, p.Name, p.UserId, p.AccountAge, Permissions.RoleOf(p) or "pemain")
+		end })
+
+	add({ name = "lookup", aliases = { "history" }, group = "utility", perm = "players.history.read", desc = "Riwayat moderasi (backend)", args = { { name = "pemain", type = "userid" } },
+		run = function(_, t)
+			if not Bridge.Enabled then return false, "Backend belum dikonfigurasi." end
+			local ok, res = Bridge.Call("player_history", { user_id = t.userId })
+			if not ok then return false, "Gagal: " .. tostring(res) end
+			local lines = { ("%s · violation %d · report %d"):format(t.name, res.violations or 0, res.reports or 0) }
+			for i, a in ipairs(res.actions or {}) do
+				if i > 5 then break end
+				table.insert(lines, ("• %s [%s] %s"):format(a.action_type, a.status, tostring(a.public_reason):sub(1, 50)))
+			end
+			if #lines == 1 then table.insert(lines, "Riwayat bersih.") end
+			return true, table.concat(lines, "\n")
+		end })
+
+	add({ name = "bans", group = "utility", perm = "players.history.read", desc = "10 ban terbaru (backend)", run = function()
+		if not Bridge.Enabled then return false, "Backend belum dikonfigurasi." end
+		local ok, res = Bridge.Call("recent_bans", {})
+		if not ok then return false, "Gagal: " .. tostring(res) end
+		local lines = {}
+		for _, b in ipairs(res.bans or {}) do
+			table.insert(lines, ("• %d — %s [%s] %s"):format(b.target_user_id, b.is_permanent and "PERMANEN" or ((b.duration_seconds or 0) // 86400 .. " hari"), b.status, tostring(b.public_reason):sub(1, 40)))
+		end
+		return true, #lines > 0 and table.concat(lines, "\n") or "Belum ada ban."
+	end })
+
+	add({ name = "reports", group = "utility", perm = "players.history.read", desc = "Report yang masih terbuka (backend)", run = function()
+		if not Bridge.Enabled then return false, "Backend belum dikonfigurasi." end
+		local ok, res = Bridge.Call("open_reports", {})
+		if not ok then return false, "Gagal: " .. tostring(res) end
+		local lines = { ("%d report terbuka"):format(res.total or 0) }
+		for _, r in ipairs(res.reports or {}) do table.insert(lines, ("• %s — pemain %d — %s [%s]"):format(r.report_code, r.reported_user_id, r.category, r.status)) end
+		return true, table.concat(lines, "\n")
+	end })
+
+	add({ name = "logs", group = "utility", perm = "players.read", desc = "Log perintah server ini", run = function()
+		local lines = env.recentLogs(12)
+		return true, #lines > 0 and table.concat(lines, "\n") or "Belum ada perintah di server ini."
+	end })
+
+	-- ===== MODERASI =====
+	add({ name = "warn", group = "moderation", perm = "moderation.warn", desc = "Beri peringatan",
+		args = { { name = "pemain", type = "players" }, { name = "alasan", type = "text", min = 3, max = 400 } },
+		run = function(ctx, targets, reason)
+			local list, skipped = harmful(ctx, targets, false)
+			for _, t in ipairs(list) do
+				local n = Integration.RecordWarn(t)
+				local text = n and ("PERINGATAN #" .. n .. " dari staf: " .. reason) or reason
+				if Integration.Active() then
+					Integration.Notif(t, text, "error") Integration.Banner(text, "Staff", t)
+				else
+					Remotes.Notify:FireClient(t, { kind = "warning", text = reason })
+				end
+				record(ctx.player, "warn", t, reason)
+			end
+			return summarize("Warn terkirim ke", list, skipped)
+		end })
+
+	add({ name = "kick", group = "moderation", perm = "moderation.kick", desc = "Keluarkan pemain",
+		args = { { name = "pemain", type = "players" }, { name = "alasan", type = "text", min = 3, max = 400 } },
+		run = function(ctx, targets, reason)
+			local list, skipped = harmful(ctx, targets, false)
+			local label = names(list)
+			for _, t in ipairs(list) do
+				record(ctx.player, "kick", t, reason) -- catat DULU (setelah Kick, objek pemain hilang)
+				t:Kick("Kamu dikeluarkan oleh staf.\nAlasan: " .. reason)
+			end
+			if #list == 0 then return summarize("Kick", list, skipped) end
+			return true, ("Kick: %s%s"):format(label, skipped > 0 and (" (%d dilewati: dilindungi)"):format(skipped) or "")
+		end })
+
+	add({ name = "ban", group = "moderation", perm = "moderation.ban.temp",
+		permFor = function(args) return (args[2] and args[2].permanent) and "moderation.ban.perm.request" or "moderation.ban.temp" end,
+		desc = "Ban (1d 1w 30d 365d perm; perm butuh persetujuan orang lain)",
+		args = { { name = "pemain", type = "userid" }, { name = "durasi", type = "duration" }, { name = "alasan", type = "text", min = 3, max = 400 } },
+		run = function(ctx, target, duration, reason) return requestAction(ctx, "ban", target, duration, reason) end })
+
+	add({ name = "unban", group = "moderation", perm = "moderation.unban", desc = "Cabut ban",
+		args = { { name = "pemain", type = "userid" }, { name = "alasan", type = "text", min = 3, max = 400 } },
+		run = function(ctx, target, reason) return requestAction(ctx, "unban", target, nil, reason) end })
+
+	-- ===== TELEPORT =====
+	add({ name = "to", aliases = { "goto" }, group = "teleport", perm = "ingame.teleport", desc = "Teleport ke pemain", args = { { name = "pemain", type = "player" } },
+		run = function(ctx, target)
+			local b = root(target)
+			if not b or not move(ctx.player, b.CFrame * CFrame.new(0, 0, 4), "cmd_to") then return false, "Karakter tidak tersedia." end
+			return true, "Teleport ke " .. target.Name
+		end })
+
+	add({ name = "bring", group = "teleport", perm = "ingame.teleport", desc = "Bawa pemain ke lu", args = { { name = "pemain", type = "players" } },
+		run = function(ctx, targets)
+			local list, skipped = harmful(ctx, targets, false)
+			local me = root(ctx.player)
+			if not me then return false, "Karakter lu tidak tersedia." end
+			for i, t in ipairs(list) do
+				move(t, me.CFrame * CFrame.new(((i - 1) % 5 - 2) * 3, 0, -5 - math.floor((i - 1) / 5) * 3), "cmd_bring")
+			end
+			return summarize("Dibawa ke lu", list, skipped)
+		end })
+
+	add({ name = "tp", group = "teleport", perm = "ingame.teleport", desc = "Pindahkan pemain A ke pemain B",
+		args = { { name = "pemain", type = "players" }, { name = "tujuan", type = "player" } },
+		run = function(ctx, targets, dest)
+			local list, skipped = harmful(ctx, targets, true)
+			local d = root(dest)
+			if not d then return false, "Karakter tujuan tidak tersedia." end
+			for _, t in ipairs(list) do move(t, d.CFrame * CFrame.new(0, 0, -4), "cmd_tp") end
+			return summarize("Dipindahkan ke " .. dest.Name, list, skipped)
+		end })
+
+	add({ name = "back", group = "teleport", perm = "ingame.teleport", desc = "Kembalikan pemain ke posisi sebelum teleport", args = { { name = "pemain", type = "players" } },
+		run = function(ctx, targets)
+			local list, skipped = harmful(ctx, targets, true)
+			local done = {}
+			for _, t in ipairs(list) do
+				local cf = lastPos[t.UserId]
+				local r = root(t)
+				if cf and r then Exemptions.Grant(t, GRACE, "cmd_back") r.CFrame = cf lastPos[t.UserId] = nil table.insert(done, t) end
+			end
+			return summarize("Dikembalikan", done, skipped)
+		end })
+
+	add({ name = "goserver", aliases = { "joinserver" }, group = "teleport", perm = "ingame.teleport",
+		desc = "Pindah ke server tertentu (JobId dari embed laporan di Discord)", args = { { name = "jobid", type = "word" } },
+		run = function(ctx, jobId)
+			if jobId == Bridge.JobId then return false, "Lu sudah berada di server itu." end
+			local ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, ctx.player) end)
+			return ok, ok and ("Memindahkan lu ke server " .. jobId:sub(1, 8) .. "…") or ("Gagal: " .. tostring(err):sub(1, 120) .. " (server mungkin sudah tutup)")
+		end })
+
+	local function shift(name, sign)
+		add({ name = name, group = "teleport", perm = "ingame.teleport", desc = (sign > 0 and "Naikkan" or "Turunkan") .. " pemain (stud)",
+			args = { { name = "pemain", type = "players" }, { name = "jarak", type = "number", min = 1, max = 500 } },
+			run = function(ctx, targets, dist)
+				local list, skipped = harmful(ctx, targets, true)
+				for _, t in ipairs(list) do local r = root(t) if r then move(t, r.CFrame + Vector3.new(0, sign * dist, 0), "cmd_" .. name) end end
+				return summarize(name, list, skipped)
+			end })
+	end
+	shift("up", 1) shift("down", -1)
+
+	add({ name = "tpos", group = "teleport", perm = "ingame.teleport", desc = "Teleport ke koordinat X Y Z",
+		args = { { name = "pemain", type = "players" }, { name = "x", type = "number", min = -100000, max = 100000 }, { name = "y", type = "number", min = -1000, max = 100000 }, { name = "z", type = "number", min = -100000, max = 100000 } },
+		run = function(ctx, targets, x, y, z)
+			local list, skipped = harmful(ctx, targets, true)
+			for _, t in ipairs(list) do move(t, CFrame.new(x, y, z), "cmd_tpos") end
+			return summarize(("Ke %d,%d,%d"):format(x, y, z), list, skipped)
+		end })
+
+	-- ===== ALAT ADMIN (sisi client diminta lewat hasil "client") =====
+	local function selfToggle(key, perm, label)
+		add({ name = key, group = "tools", perm = perm, desc = label .. " (on/off)", args = { { name = "status", type = "onoff", optional = true } },
+			run = function(ctx, want)
+				if want == nil then want = not Exemptions.GetAdminState(ctx.player, key) end
+				Exemptions.SetAdminState(ctx.player, key, want)
+				return true, label .. (want and " AKTIF" or " MATI"), { kind = key, enabled = want }
+			end })
+	end
+	selfToggle("fly", "ingame.fly", "Fly")
+	selfToggle("noclip", "ingame.noclip", "Noclip")
+
+	add({ name = "view", aliases = { "spectate" }, group = "tools", perm = "ingame.spectate", desc = "Pantau pemain", args = { { name = "pemain", type = "player" } },
+		run = function(_, t) return true, "Memantau " .. t.Name .. " (;unview untuk berhenti)", { kind = "view", userId = t.UserId } end })
+	add({ name = "unview", group = "tools", perm = "ingame.spectate", desc = "Berhenti memantau", run = function() return true, "Pantauan dihentikan", { kind = "unview" } end })
+	add({ name = "esp", group = "tools", perm = "ingame.esp", desc = "Highlight semua pemain (on/off)", args = { { name = "status", type = "onoff", optional = true } },
+		run = function(_, want) return true, "ESP diubah", { kind = "esp", enabled = want } end })
+
+	add({ name = "copyavatar", aliases = { "char" }, group = "tools", perm = "ingame.copy_avatar", desc = "Salin tampilan avatar pemain", args = { { name = "pemain", type = "userid" } },
+		run = function(ctx, t) local ok, m = applyDescription(ctx.player, t.userId) return ok, m end })
+	add({ name = "resetavatar", group = "tools", perm = "ingame.copy_avatar", desc = "Kembalikan avatar asli lu",
+		run = function(ctx) local ok, m = applyDescription(ctx.player, ctx.player.UserId) return ok, m end })
+
+	add({ name = "invisible", aliases = { "invis" }, group = "tools", perm = "ingame.manage", desc = "Sembunyikan karakter lu (untuk memantau)",
+		run = function(ctx) if not ctx.player.Character then return false, "Karakter tidak tersedia." end setInvisible(ctx.player.Character, true) return true, "Lu tidak terlihat." end })
+	add({ name = "visible", group = "tools", perm = "ingame.manage", desc = "Tampilkan karakter lu lagi",
+		run = function(ctx) if not ctx.player.Character then return false, "Karakter tidak tersedia." end setInvisible(ctx.player.Character, false) return true, "Lu terlihat lagi." end })
+
+	add({ name = "god", group = "tools", perm = "ingame.manage", desc = "ForceField untuk pemain", args = { { name = "pemain", type = "players" } },
+		run = function(ctx, targets)
+			local list, skipped = harmful(ctx, targets, true)
+			for _, t in ipairs(list) do
+				local c = t.Character
+				if c and not c:FindFirstChild("SmartACGod") then
+					local ff = Instance.new("ForceField") ff.Name = "SmartACGod" ff.Visible = false ff.Parent = c
+				end
+			end
+			return summarize("God aktif", list, skipped)
+		end })
+	add({ name = "ungod", group = "tools", perm = "ingame.manage", desc = "Cabut ForceField", args = { { name = "pemain", type = "players" } },
+		run = function(ctx, targets)
+			local list, skipped = harmful(ctx, targets, true)
+			for _, t in ipairs(list) do local ff = t.Character and t.Character:FindFirstChild("SmartACGod") if ff then ff:Destroy() end end
+			return summarize("God dicabut", list, skipped)
+		end })
+
+	-- ===== KELOLA PEMAIN =====
+	local function manage(name, perm, desc, args, fn, verb, allowSelf)
+		add({ name = name, group = "manage", perm = perm, desc = desc, args = args, run = function(ctx, targets, ...)
+			local list, skipped = harmful(ctx, targets, allowSelf ~= false)
+			for _, t in ipairs(list) do fn(t, ...) end
+			return summarize(verb, list, skipped)
+		end })
+	end
+	local P = { name = "pemain", type = "players" }
+	manage("speed", "ingame.manage", "Atur WalkSpeed (0-100, normal 16)", { P, { name = "nilai", type = "number", min = 0, max = 100 } },
+		function(t, v) local h = hum(t) if h then h.WalkSpeed = v end end, "Speed diubah")
+	manage("jump", "ingame.manage", "Atur JumpPower (0-150, normal 50)", { P, { name = "nilai", type = "number", min = 0, max = 150 } },
+		function(t, v) local h = hum(t) if h then pcall(function() h.UseJumpPower = true end) h.JumpPower = v end end, "Jump diubah")
+	manage("normal", "ingame.manage", "Kembalikan speed & jump ke normal", { P },
+		function(t) local h = hum(t) if h then h.WalkSpeed = DEFAULT_WALK pcall(function() h.UseJumpPower = true end) h.JumpPower = DEFAULT_JUMP end end, "Speed/jump direset")
+	manage("heal", "ingame.manage", "Pulihkan darah penuh", { P },
+		function(t) local h = hum(t) if h and h.Health > 0 then h.Health = h.MaxHealth end end, "Dipulihkan")
+	manage("health", "ingame.manage", "Set darah (1-1000)", { P, { name = "nilai", type = "number", min = 1, max = 1000 } },
+		function(t, v) local h = hum(t) if h and h.Health > 0 then h.Health = math.min(v, h.MaxHealth) end end, "Darah diubah")
+	manage("respawn", "ingame.manage", "Respawn pemain", { P }, function(t) pcall(function() t:LoadCharacter() end) end, "Respawn")
+	manage("freeze", "ingame.manage", "Bekukan pemain", { P }, function(t) local r = root(t) if r then r.Anchored = true end end, "Dibekukan")
+	manage("unfreeze", "ingame.manage", "Lepas pembekuan", { P }, function(t) local r = root(t) if r then r.Anchored = false end end, "Dilepas")
+	manage("sit", "ingame.manage", "Dudukkan pemain", { P }, function(t) local h = hum(t) if h then h.Sit = true end end, "Duduk")
+	manage("kill", "ingame.kill", "Matikan pemain (diaudit)", { P }, function(t) local h = hum(t) if h then h.Health = 0 end end, "Dimatikan", false)
+
+
+	-- ===== PLAYTEST SINAR RP: uang, status, VIP (batas per role dari Config.StaffMoney) =====
+	local SM = Config.StaffMoney
+	local cooldowns = {}
+	local function rp(n)
+		local r = tostring(math.floor(n)):reverse():gsub("(%d%d%d)", "%1.")
+		r = r:reverse()
+		if r:sub(1, 1) == "." then r = r:sub(2) end
+		return "Rp" .. r
+	end
+	-- Perintah grup "playtest": helper kena cooldown per perintah (Config.StaffMoney.HelperCooldownSeconds).
+	local function addPlaytest(def)
+		local inner = def.run
+		def.group = "playtest"
+		def.run = function(ctx, ...)
+			local key = ctx.player.UserId .. ":" .. def.name
+			if ctx.role == "helper" and (cooldowns[key] or 0) > os.clock() then
+				return false, ("Cooldown: tunggu %d detik untuk ;%s lagi."):format(math.ceil(cooldowns[key] - os.clock()), def.name)
+			end
+			local ok, msg, client = inner(ctx, ...)
+			if ok and ctx.role == "helper" then cooldowns[key] = os.clock() + SM.HelperCooldownSeconds end
+			return ok, msg, client
+		end
+		add(def)
+	end
+	local function needEkonomi()
+		local E = Integration.Ekonomi()
+		if not E then return nil, "Butuh game SINAR RP (modul Ekonomi tidak ditemukan)." end
+		return E
+	end
+	local function capOk(ctx, n)
+		local cap = SM.Caps[ctx.role]
+		if cap and n > cap then return false, ("Batas role %s: maks %s per perintah."):format(ctx.role, rp(cap)) end
+		return true
+	end
+	local function setMoney(ctx, n, saldo)
+		local E, err = needEkonomi()
+		if not E then return false, err end
+		local okCap, why = capOk(ctx, n)
+		if not okCap then return false, why end
+		local cur = saldo and E.Saldo(ctx.player) or E.Uang(ctx.player)
+		local add_, sub_ = saldo and E.TambahSaldo or E.TambahUang, saldo and E.KurangSaldo or E.KurangUang
+		local ok = true
+		if n > cur then ok = add_(ctx.player, n - cur, "Playtest staf") elseif n < cur then ok = sub_(ctx.player, cur - n, "Playtest staf") end
+		if not ok then return false, "Ekonomi menolak perubahan." end
+		return true, (saldo and "Saldo" or "Uang tunai") .. " diatur: " .. rp(n)
+	end
+	local function giveMoney(ctx, name, target, n, saldo)
+		local E, err = needEkonomi()
+		if not E then return false, err end
+		local okCap, why = capOk(ctx, n)
+		if not okCap then return false, why end
+		local enforce = ctx.role == "helper" and SM.HelperSameTargetOnce
+		local payload = {
+			actor_user_id = ctx.player.UserId, role_key = ctx.role, command = name, target_user_id = target.UserId, amount = n,
+			enforce = enforce, window_hours = SM.HelperSameTargetWindowHours,
+		}
+		if enforce then
+			-- "Sekali per pemain" harus tahan restart/pindah server -> dicatat di backend (fail-closed untuk helper).
+			if not Bridge.Enabled then return false, "Helper butuh backend aktif untuk batas 'sekali per pemain'." end
+			local ok, res = Bridge.Call("money_grant", payload)
+			if not ok then return false, "Gagal memeriksa batas (backend): " .. tostring(res) end
+			if res.outcome == "duplicate" then return false, ("Helper hanya boleh ;%s SEKALI ke pemain yang sama (%s)."):format(name, target.Name) end
+		else
+			task.spawn(function() Bridge.Call("money_grant", payload) end) -- jejak keuangan (best-effort)
+		end
+		local fn = saldo and E.TambahSaldo or E.TambahUang
+		if not fn(target, n, "Playtest staf") then return false, "Ekonomi menolak (cek pemain/jumlah)." end
+		Integration.Notif(target, ("Staf memberi %s %s."):format(rp(n), saldo and "saldo" or "tunai"), "sukses")
+		return true, ("Memberi %s %s ke %s"):format(rp(n), saldo and "saldo" or "tunai", target.DisplayName)
+	end
+	local AMOUNT = { name = "jumlah", type = "integer", min = 0, max = 1e10 }
+	local AMOUNT1 = { name = "jumlah", type = "integer", min = 1, max = 1e10 }
+
+	addPlaytest({ name = "setuang", perm = "sinar.money", desc = "Atur uang tunai lu sendiri", args = { AMOUNT },
+		run = function(ctx, n) return setMoney(ctx, n, false) end })
+	addPlaytest({ name = "setsaldo", perm = "sinar.money", desc = "Atur saldo bank lu sendiri", args = { AMOUNT },
+		run = function(ctx, n) return setMoney(ctx, n, true) end })
+	addPlaytest({ name = "kasihuang", perm = "sinar.money", desc = "Beri uang tunai ke pemain", args = { { name = "pemain", type = "player" }, AMOUNT1 },
+		run = function(ctx, t, n) return giveMoney(ctx, "kasihuang", t, n, false) end })
+	addPlaytest({ name = "kasihsaldo", perm = "sinar.money", desc = "Beri saldo bank ke pemain", args = { { name = "pemain", type = "player" }, AMOUNT1 },
+		run = function(ctx, t, n) return giveMoney(ctx, "kasihsaldo", t, n, true) end })
+
+	addPlaytest({ name = "cek", perm = "sinar.self", desc = "Lihat uang/saldo/KTP pemain", args = { { name = "pemain", type = "player", optional = true } },
+		run = function(ctx, t)
+			local E, err = needEkonomi()
+			if not E then return false, err end
+			t = t or ctx.player
+			return true, ("%s | Tunai %s | Saldo %s | KTP %s"):format(t.DisplayName, rp(E.Uang(t)), rp(E.Saldo(t)), t:GetAttribute("KTP") and "punya" or "belum")
+		end })
+	addPlaytest({ name = "sembuh", perm = "sinar.self", desc = "Pulihkan HP lu penuh",
+		run = function(ctx) local h = hum(ctx.player) if not h then return false, "Karakter tidak tersedia." end h.Health = h.MaxHealth return true, "HP dipulihkan penuh." end })
+	addPlaytest({ name = "wafat", perm = "sinar.self", desc = "Matikan karakter lu (tes EMS)",
+		run = function(ctx) local h = hum(ctx.player) if not h or h.Health <= 0 then return false, "Karakter tidak tersedia." end h.Health = 0 return true, "Karakter dimatikan (tes)." end })
+	addPlaytest({ name = "cepat", perm = "sinar.self", desc = "Atur kecepatan jalan lu (default 16)", args = { { name = "angka", type = "integer", min = 0, max = 500, optional = true } },
+		run = function(ctx, n) local h = hum(ctx.player) if not h then return false, "Karakter tidak tersedia." end n = n or 16 h.WalkSpeed = n return true, "Kecepatan jalan: " .. n end })
+	addPlaytest({ name = "lompat", perm = "sinar.self", desc = "Atur kekuatan lompat lu (default 50)", args = { { name = "angka", type = "integer", min = 0, max = 1000, optional = true } },
+		run = function(ctx, n) local h = hum(ctx.player) if not h then return false, "Karakter tidak tersedia." end n = n or 50 pcall(function() h.UseJumpPower = true end) h.JumpPower = n return true, "Kekuatan lompat: " .. n end })
+	addPlaytest({ name = "stat", perm = "sinar.self", desc = "Atur status tubuh lu (lapar/haus/mood 0-100)",
+		args = { { name = "jenis", type = "enum", values = { "lapar", "haus", "mood" } }, { name = "nilai", type = "integer", min = 0, max = 100 } },
+		run = function(ctx, jenis, n)
+			ctx.player:SetAttribute(jenis == "lapar" and "Lapar" or jenis == "haus" and "Haus" or "Mood", n)
+			return true, ("Status %s = %d"):format(jenis, n)
+		end })
+	addPlaytest({ name = "reset", perm = "sinar.self", desc = "Respawn karakter lu",
+		run = function(ctx)
+			local ok = pcall(function() ctx.player:LoadCharacterAsync() end) or pcall(function() ctx.player:LoadCharacter() end)
+			return ok, ok and "Respawn." or "Respawn gagal."
+		end })
+	-- VIP: TIDAK untuk helper (izin sinar.vip hanya founder/management/developer/administrator)
+	addPlaytest({ name = "vipon", perm = "sinar.vip", desc = "Aktifkan tampilan VIP (tes)", run = function(ctx) ctx.player:SetAttribute("VIP", true) return true, "Tampilan VIP aktif (tes)." end })
+	addPlaytest({ name = "vipoff", perm = "sinar.vip", desc = "Matikan tampilan VIP", run = function(ctx) ctx.player:SetAttribute("VIP", false) return true, "Tampilan VIP mati." end })
+
+	-- ===== SERVER & ANTI-CHEAT =====
+	add({ name = "grace", group = "server", perm = "ingame.exempt", desc = "Beri pemain kekebalan gerakan sementara (detik)",
+		args = { P, { name = "detik", type = "number", min = 1, max = 300 } },
+		run = function(ctx, targets, sec)
+			local list, skipped = harmful(ctx, targets, true)
+			for _, t in ipairs(list) do Exemptions.Grant(t, sec, "cmd_grace") end
+			return summarize(("Kebal %ds"):format(sec), list, skipped)
+		end })
+	add({ name = "exempt", group = "server", perm = "ingame.exempt", desc = "Kecualikan pemain dari cek gerakan (on/off) — mis. untuk event",
+		args = { P, { name = "status", type = "onoff", optional = true } },
+		run = function(ctx, targets, want)
+			local list, skipped = harmful(ctx, targets, true)
+			for _, t in ipairs(list) do Exemptions.SetAdminState(t, "manual", want ~= false) end
+			return summarize(want == false and "Pengecualian dicabut" or "Dikecualikan dari cek gerakan", list, skipped)
+		end })
+	add({ name = "slock", group = "server", perm = "ingame.server", desc = "Kunci server (hanya staf yang bisa masuk)",
+		run = function() locked = true return true, "Server DIKUNCI. Pemain baru (non-staf) akan di-kick. ;unslock untuk membuka." end })
+	add({ name = "unslock", group = "server", perm = "ingame.server", desc = "Buka kunci server", run = function() locked = false return true, "Server dibuka." end })
+	add({ name = "shutdown", group = "server", perm = "ingame.shutdown", desc = "Tutup server ini — HANYA Founder & Developer (konfirmasi 2 langkah)", args = { { name = "alasan", type = "text", min = 3, max = 200 } },
+		run = function(ctx, reason)
+			local exp = pendingShutdown[ctx.player.UserId]
+			if not exp or exp < os.clock() then
+				pendingShutdown[ctx.player.UserId] = os.clock() + 20
+				return true, "KONFIRMASI: ketik perintah yang SAMA lagi dalam 20 detik untuk menutup server ini."
+			end
+			pendingShutdown[ctx.player.UserId] = nil
+			pcall(Bridge.Call, "audit", { actor_user_id = ctx.player.UserId, role_key = ctx.role, action = "ingame.cmd_shutdown", target_id = "", details = { reason = reason } })
+			for _, p in ipairs(Players:GetPlayers()) do p:Kick("Server ditutup oleh staf.\nAlasan: " .. reason) end
+			return true, "Server ditutup."
+		end })
+
+	-- ===== PENGUMUMAN =====
+	add({ name = "announce", aliases = { "m" }, group = "announce", perm = "announce.server", desc = "Pengumuman di server ini", args = { { name = "pesan", type = "text", min = 3, max = 200 } },
+		run = function(ctx, text)
+			local from = (ctx.role or "Staff") .. " " .. ctx.player.DisplayName
+			if not Integration.Banner(text, from) then Remotes.Notify:FireAllClients({ kind = "announce", text = text, from = ctx.player.DisplayName }) end
+			return true, "Pengumuman server terkirim."
+		end })
+	add({ name = "gannounce", aliases = { "gm" }, group = "announce", perm = "announce.global", desc = "Pengumuman ke SEMUA server", args = { { name = "pesan", type = "text", min = 3, max = 200 } },
+		run = function(ctx, text)
+			local how = Executor.Announce(HttpService:GenerateGUID(false), text, ctx.player.DisplayName)
+			return true, "Pengumuman global: " .. how .. " (best-effort)."
+		end })
+	add({ name = "notify", group = "announce", perm = "ingame.notify", desc = "Pesan pribadi ke pemain", args = { P, { name = "pesan", type = "text", min = 3, max = 200 } },
+		run = function(ctx, targets, text)
+			for _, t in ipairs(targets) do
+				if not Integration.Notif(t, text, "info") then Remotes.Notify:FireClient(t, { kind = "announce", text = text, from = ctx.player.DisplayName }) end
+			end
+			return true, "Dikirim ke " .. names(targets)
+		end })
+end
+
+return Defs
+]]></ProtectedString>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="RBX0005">
+          <Properties>
+            <string name="Name">Process</string>
+            <ProtectedString name="Source"><![CDATA[-- Parser perintah gaya Kohl's: awalan ";" atau ":", pemisah spasi, kutip untuk argumen berspasi,
+-- argumen terakhir bertipe "text" mengambil SISA kalimat. Semua tipe divalidasi di sini (server).
+local Players = game:GetService("Players")
+local Permissions = require(script.Parent.Parent.Permissions)
+
+local Process = {}
+
+-- ---------- tokenizer ----------
+function Process.Tokenize(line)
+	local tokens, i, n = {}, 1, #line
+	while i <= n do
+		while i <= n and line:sub(i, i) == " " do i += 1 end
+		if i > n then break end
+		local start, text = i, nil
+		if line:sub(i, i) == '"' then
+			local close = line:find('"', i + 1, true)
+			if close then
+				text = line:sub(i + 1, close - 1)
+				i = close + 1
+			end
+		end
+		if not text then
+			local j = line:find(" ", i, true) or (n + 1)
+			text = line:sub(i, j - 1)
+			i = j
+		end
+		table.insert(tokens, { text = text, start = start })
+	end
+	return tokens
+end
+
+-- ---------- pemilih pemain ----------
+local function matchOne(ctx, token)
+	local lower = token:lower():gsub("^@", "")
+	local exact, partial = {}, {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		local n, d = p.Name:lower(), p.DisplayName:lower()
+		if n == lower or d == lower or tostring(p.UserId) == lower then
+			table.insert(exact, p)
+		elseif n:sub(1, #lower) == lower or d:sub(1, #lower) == lower then
+			table.insert(partial, p)
+		end
+	end
+	local list = #exact > 0 and exact or partial
+	if #list == 0 then return nil, ("pemain '%s' tidak ditemukan"):format(token) end
+	if #list > 1 then
+		local names = {}
+		for i = 1, math.min(4, #list) do names[i] = list[i].Name end
+		return nil, ("'%s' ambigu: %s"):format(token, table.concat(names, ", "))
+	end
+	return list[1]
+end
+
+function Process.ResolvePlayers(ctx, token)
+	local lower = token:lower()
+	local out = {}
+	if lower == "me" or lower == "@me" then
+		out = { ctx.player }
+	elseif lower == "all" then
+		out = Players:GetPlayers()
+	elseif lower == "others" then
+		for _, p in ipairs(Players:GetPlayers()) do if p ~= ctx.player then table.insert(out, p) end end
+	elseif lower == "random" then
+		local all = Players:GetPlayers()
+		out = { all[math.random(#all)] }
+	elseif lower == "admins" or lower == "nonadmins" then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if Permissions.IsStaff(p) == (lower == "admins") then table.insert(out, p) end
+		end
+	else
+		local p, err = matchOne(ctx, token)
+		if not p then return nil, err end
+		out = { p }
+	end
+	if #out == 0 then return nil, "tidak ada pemain yang cocok" end
+	if #out > 25 then out = { table.unpack(out, 1, 25) } end
+	return out
+end
+
+-- ---------- tipe argumen ----------
+local DURATIONS = {
+	["1d"] = { seconds = 86400 }, ["1w"] = { seconds = 604800 }, ["30d"] = { seconds = 2592000 },
+	["365d"] = { seconds = 31536000 }, ["perm"] = { permanent = true }, ["permanent"] = { permanent = true },
+}
+
+-- Mengembalikan (nilai, err, jumlahTokenDipakai)
+local function parseArg(ctx, spec, tokens, k, line)
+	local tok = tokens[k]
+	if not tok then
+		if spec.optional then return nil, nil, 0 end
+		return nil, ("argumen '%s' wajib diisi"):format(spec.name), 0
+	end
+	local t = spec.type
+	if t == "text" then
+		local rest = line:sub(tok.start)
+		rest = rest:gsub('^"(.*)"$', "%1")
+		if #rest < (spec.min or 1) or #rest > (spec.max or 400) or utf8.len(rest) == nil then
+			return nil, ("'%s' harus %d-%d karakter"):format(spec.name, spec.min or 1, spec.max or 400), 0
+		end
+		return rest, nil, #tokens - k + 1
+	elseif t == "players" then
+		local list, err = Process.ResolvePlayers(ctx, tok.text)
+		return list, err, 1
+	elseif t == "player" then
+		local list, err = Process.ResolvePlayers(ctx, tok.text)
+		if not list then return nil, err, 1 end
+		if #list ~= 1 then return nil, "pilih tepat 1 pemain", 1 end
+		return list[1], nil, 1
+	elseif t == "userid" then -- pemain offline boleh: UserId angka atau username Roblox
+		local n = tonumber(tok.text)
+		if n and n % 1 == 0 and n > 0 and n < 1e13 then return { userId = n, name = "UserId " .. n }, nil, 1 end
+		local inServer = matchOne(ctx, tok.text)
+		if inServer then return { userId = inServer.UserId, name = inServer.Name, player = inServer }, nil, 1 end
+		if not tok.text:match("^[%w_]{3,20}$") then return nil, "username Roblox tidak valid", 1 end
+		local ok, id = pcall(function() return Players:GetUserIdFromNameAsync(tok.text) end)
+		if ok and type(id) == "number" then return { userId = id, name = tok.text }, nil, 1 end
+		return nil, ("username '%s' tidak ditemukan"):format(tok.text), 1
+	elseif t == "duration" then
+		local d = DURATIONS[tok.text:lower()]
+		if not d then return nil, "durasi harus: 1d, 1w, 30d, 365d, atau perm", 1 end
+		return d, nil, 1
+	elseif t == "number" then
+		local n = tonumber(tok.text)
+		if not n or n ~= n or n == math.huge or n == -math.huge then return nil, ("'%s' harus angka"):format(spec.name), 1 end
+		if n < (spec.min or -1e9) or n > (spec.max or 1e9) then
+			return nil, ("'%s' harus %s s/d %s"):format(spec.name, tostring(spec.min), tostring(spec.max)), 1
+		end
+		return n, nil, 1
+	elseif t == "word" then
+		if tok.text:match("^[%w%-]+$") and #tok.text >= 8 and #tok.text <= 64 then return tok.text, nil, 1 end
+		return nil, ("'%s' tidak valid"):format(spec.name), 1
+	elseif t == "integer" then
+		local n = tonumber(tok.text)
+		if not n or n ~= n or n % 1 ~= 0 then return nil, ("'%s' harus bilangan bulat"):format(spec.name), 1 end
+		if n < (spec.min or 0) or n > (spec.max or 1e10) then
+			return nil, ("'%s' harus %s s/d %s"):format(spec.name, tostring(spec.min or 0), tostring(spec.max or 1e10)), 1
+		end
+		return n, nil, 1
+	elseif t == "enum" then
+		local v = tok.text:lower()
+		for _, allowed in ipairs(spec.values or {}) do if v == allowed then return v, nil, 1 end end
+		return nil, ("'%s' harus salah satu: %s"):format(spec.name, table.concat(spec.values or {}, ", ")), 1
+	elseif t == "onoff" then
+		local v = tok.text:lower()
+		if v == "on" or v == "true" or v == "1" then return true, nil, 1 end
+		if v == "off" or v == "false" or v == "0" then return false, nil, 1 end
+		return nil, "gunakan on atau off", 1
+	end
+	return nil, "tipe argumen tidak dikenal", 1
+end
+
+-- Hasil: { command = def, args = {...} } atau nil, pesanError
+function Process.Parse(ctx, line, registry)
+	line = line:gsub("^%s*[;:]?%s*", "")
+	local tokens = Process.Tokenize(line)
+	if #tokens == 0 then return nil, "ketik perintah, mis. ;help" end
+	local def = registry.Find(tokens[1].text)
+	if not def then return nil, ("perintah '%s' tidak dikenal. Coba ;help"):format(tokens[1].text) end
+	local args, k = {}, 2
+	for i, spec in ipairs(def.args or {}) do
+		local value, err, used = parseArg(ctx, spec, tokens, k, line)
+		if err then return nil, ("%s — pemakaian: %s"):format(err, registry.Usage(def)) end
+		args[i] = value
+		k += used
+	end
+	return { command = def, args = args }
+end
+
+return Process
+]]></ProtectedString>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="RBX0006">
+          <Properties>
+            <string name="Name">Registry</string>
+            <ProtectedString name="Source"><![CDATA[-- Registry perintah (pola mirip Kohl's: definisi berbasis data -> satu jalur parse/otorisasi/eksekusi).
+local Registry = {}
+local byName, list = {}, {}
+
+function Registry.Add(def)
+	assert(def.name and def.run, "perintah butuh name & run")
+	def.group = def.group or "utility"
+	def.args = def.args or {}
+	table.insert(list, def)
+	byName[def.name] = def
+	for _, a in ipairs(def.aliases or {}) do byName[a] = def end
+end
+
+function Registry.Find(name) return byName[name:lower()] end
+function Registry.All() return list end
+
+function Registry.Usage(def)
+	local parts = { def.name }
+	for _, a in ipairs(def.args) do
+		table.insert(parts, a.optional and ("[" .. a.name .. "]") or ("<" .. a.name .. ">"))
+	end
+	return table.concat(parts, " ")
+end
+
+return Registry
+]]></ProtectedString>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0007">
+        <Properties>
+          <string name="Name">Admin</string>
+          <ProtectedString name="Source"><![CDATA[-- Layanan perintah admin (SERVER) bergaya Kohl's: satu pintu "Admin" (RemoteFunction) dengan op:
+--   hello | catalog | players | logs | run{text}
+-- Alur "run": cek staf -> parse & validasi argumen -> cek izin -> eksekusi -> catat log + audit backend.
+-- Client hanya MEMINTA. UI yang menyembunyikan perintah bukan otorisasi; semua dicek ulang di sini.
+local Players = game:GetService("Players")
+local Bridge = require(script.Parent.Bridge)
+local Guard = require(script.Parent.Guard)
+local Permissions = require(script.Parent.Permissions)
+local Process = require(script.Parent.Cmd.Process)
+local Registry = require(script.Parent.Cmd.Registry)
+local Defs = require(script.Parent.Cmd.Defs)
+local Remotes = require(script.Parent.Remotes)
+local Scoring = require(script.Parent.Scoring)
+local Util = require(script.Parent.Util)
+
+local V = Util.V
+local Admin = {}
+
+local LOG, LOG_MAX = {}, 200
+
+local function log(ctx, text, ok, message)
+	table.insert(LOG, { t = os.time(), who = ctx.player.Name, text = text:sub(1, 120), ok = ok, msg = tostring(message):sub(1, 80) })
+	if #LOG > LOG_MAX then table.remove(LOG, 1) end
+end
+
+local function recentLogs(n)
+	local out = {}
+	for i = math.max(1, #LOG - n + 1), #LOG do
+		local e = LOG[i]
+		table.insert(out, ("%s  %s  %s %s"):format(os.date("!%H:%M:%S", e.t), e.who, e.ok and "✓" or "✗", e.text))
+	end
+	return out
+end
+
+-- Izin: perm bisa string; permFor(args) menimpa untuk perintah yang izinnya tergantung argumen (mis. ban permanen).
+local function permFor(def, args)
+	if def.permFor and args then return def.permFor(args) end
+	return def.perm
+end
+local function canUse(ctx, def)
+	local perm = def.perm
+	return perm == nil or Permissions.Has(ctx.player, perm)
+end
+
+local function catalog(ctx)
+	local out = {}
+	for _, d in ipairs(Registry.All()) do
+		if canUse(ctx, d) then
+			local args = {}
+			for _, a in ipairs(d.args) do table.insert(args, { name = a.name, type = a.type, optional = a.optional == true, values = a.values }) end
+			table.insert(out, { name = d.name, aliases = d.aliases or {}, group = d.group, desc = d.desc or "", usage = Registry.Usage(d), args = args })
+		end
+	end
+	table.sort(out, function(a, b) if a.group ~= b.group then return a.group < b.group end return a.name < b.name end)
+	return out
+end
+
+local function makeCtx(player)
+	return { player = player, role = Permissions.RoleOf(player), rank = Permissions.Rank(player) }
+end
+
+local function run(player, text)
+	local ctx = makeCtx(player)
+	local parsed, err = Process.Parse(ctx, text, Registry)
+	if not parsed then return { ok = false, message = err } end
+	local def = parsed.command
+
+	local perm = permFor(def, parsed.args)
+	if perm and not Permissions.Has(player, perm) then
+		log(ctx, text, false, "ditolak: izin")
+		Bridge.Enqueue("audit", { actor_user_id = player.UserId, role_key = ctx.role, action = "ingame.denied", target_id = "", details = { command = def.name, perm = perm } })
+		return { ok = false, message = ("Role lu (%s) tidak punya izin untuk ;%s"):format(ctx.role or "?", def.name) }
+	end
+
+	local ok, a, b, c = pcall(def.run, ctx, table.unpack(parsed.args, 1, #def.args))
+	if not ok then
+		warn("[SmartAC] perintah error:", def.name, a)
+		log(ctx, text, false, "error internal")
+		return { ok = false, message = "Perintah gagal (error internal). Cek Output server." }
+	end
+	log(ctx, text, a == true, b)
+	if def.group ~= "utility" and a == true then
+		-- Semua perintah berdampak diaudit ke backend (siapa, apa, kapan).
+		Bridge.Enqueue("audit", {
+			actor_user_id = player.UserId, role_key = ctx.role, action = "ingame.cmd_" .. def.name,
+			target_id = "", details = { text = text:sub(1, 150) },
+		})
+	end
+	return { ok = a == true, message = tostring(b or ""), client = c }
+end
+
+-- Dipakai Api.RunSinarCommand: chat "/setuang ..." milik SINAR RP diteruskan ke pipeline yang SAMA (izin, batas, audit).
+function Admin.Run(player, text)
+	if not Permissions.IsStaff(player) then return { ok = false, message = "Perintah ini khusus staf." } end
+	return run(player, text)
+end
+
+function Admin.Start()
+	Defs.Register(Registry, { canUse = canUse, recentLogs = recentLogs })
+
+	Guard.Invoke(Remotes.Admin, {
+		Args = { V.String(2, 24), function(v) return typeof(v) == "table" end },
+		PerSecond = 8, Burst = 15,
+	}, function(player, op, data)
+		if not Permissions.IsStaff(player) then
+			-- Jangan bocorkan apa pun; catat sebagai sinyal (bisa exploiter yang mencoba remote admin).
+			Scoring.Hit(player, "admin.unauthorized", 20, 3, { op = op })
+			return { ok = false, error = "denied" }
+		end
+		if op == "hello" then
+			return { ok = true, role = Permissions.RoleOf(player), rank = Permissions.Rank(player), perms = Permissions.List(player) }
+		elseif op == "catalog" then
+			return { ok = true, commands = catalog(makeCtx(player)) }
+		elseif op == "players" then
+			local out = {}
+			for _, p in ipairs(Players:GetPlayers()) do
+				table.insert(out, { userId = p.UserId, name = p.Name, displayName = p.DisplayName, staff = Permissions.RoleOf(p) })
+				if #out >= 100 then break end
+			end
+			return { ok = true, players = out }
+		elseif op == "logs" then
+			return { ok = true, lines = recentLogs(30) }
+		elseif op == "run" then
+			if not V.String(1, 300)(data.text) then return { ok = false, message = "Teks perintah tidak valid." } end
+			return run(player, data.text)
+		end
+		return { ok = false, error = "unknown_op" }
+	end)
+end
+
+return Admin
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0008">
+        <Properties>
+          <string name="Name">Bridge</string>
+          <ProtectedString name="Source"><![CDATA[-- Komunikasi ke backend (Supabase Edge Function "roblox-gateway") via HttpService.
+-- Aman: payload kecil, batch, timeout, retry + backoff, antrean ber-batas, rahasia tidak pernah di-log.
+local HttpService = game:GetService("HttpService")
+local Config = require(script.Parent.Parent.Config)
+local Util = require(script.Parent.Util)
+
+local Bridge = {}
+local cfg = Config.Backend
+
+Bridge.Enabled = not (string.find(cfg.Key, "GANTI", 1, true) or string.find(cfg.Url, "PROJECT_REF", 1, true))
+Bridge.JobId = (game.JobId ~= "" and game.JobId) or "studio-test"
+
+local failures = 0
+local MAX_QUEUE = 200
+local queues = { violations = {}, audit = {} }
+local started = false
+local lastWarn = -100
+local lastReject = {}
+local announcedOk = false
+
+function Bridge.Backoff()
+	return math.min(60, 2 ^ math.min(failures, 6))
+end
+
+-- Mengembalikan (ok:boolean, hasil_atau_kode_error)
+function Bridge.Call(kind, data)
+	if not Bridge.Enabled then
+		return false, "bridge_disabled"
+	end
+	local body = HttpService:JSONEncode({
+		kind = kind,
+		nonce = HttpService:GenerateGUID(false),
+		ts = DateTime.now():ToIsoDate(),
+		job_id = Bridge.JobId,
+		place_id = game.PlaceId,
+		data = data or {},
+	})
+	local ok, res = pcall(function()
+		return HttpService:RequestAsync({
+			Url = cfg.Url,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json", ["x-sac-key"] = cfg.Key },
+			Body = body,
+		})
+	end)
+	if not ok then
+		failures += 1
+		if os.clock() - lastWarn > 60 then
+			lastWarn = os.clock()
+			Util.Warn("Request ke backend gagal (cek: Game Settings > Security > Allow HTTP Requests, URL, internet):", tostring(res))
+		end
+		return false, "http_error"
+	end
+	local decoded
+	pcall(function() decoded = HttpService:JSONDecode(res.Body) end)
+	if not res.Success then
+		if res.StatusCode >= 500 or res.StatusCode == 429 then failures += 1 end
+		local code = (decoded and decoded.error) or ("http_" .. tostring(res.StatusCode))
+		-- Jangan gagal diam-diam: tampilkan penolakan backend (maks 1x per 30 dtk per jenis+kode).
+		local key = kind .. ":" .. tostring(code)
+		if os.clock() - (lastReject[key] or -100) > 30 then
+			lastReject[key] = os.clock()
+			Util.Warn(("Backend menolak '%s' (HTTP %d): %s"):format(kind, res.StatusCode, tostring(code)))
+		end
+		return false, code
+	end
+	failures = 0
+	if not announcedOk then
+		announcedOk = true
+		Util.Log("Terhubung ke backend (request pertama sukses: " .. kind .. ").")
+	end
+	return true, decoded or {}
+end
+
+-- Antrean ber-batas (buang yang paling lama kalau penuh) supaya memori tidak menumpuk saat backend mati.
+function Bridge.Enqueue(kind, item)
+	local q = queues[kind]
+	if #q >= MAX_QUEUE then
+		table.remove(q, 1)
+	end
+	table.insert(q, item)
+end
+
+local function flush(kind, batchSize, field)
+	local q = queues[kind]
+	if #q == 0 then return end
+	local batch = {}
+	for i = 1, math.min(batchSize, #q) do batch[i] = q[i] end
+	local ok, res
+	if kind == "violations" then
+		ok, res = Bridge.Call("violations", { items = batch })
+	else
+		ok, res = Bridge.Call("audit", batch[1])
+		batch = { batch[1] }
+	end
+	if ok then
+		for _ = 1, #batch do table.remove(q, 1) end
+	elseif res == "invalid_violation" or res == "invalid_audit" or res == "invalid_batch" then
+		for _ = 1, #batch do table.remove(q, 1) end -- payload buruk: buang, jangan macet selamanya
+		Util.Warn("Item dibuang karena ditolak backend:", res)
+	end
+end
+
+function Bridge.Start()
+	if started then return end
+	started = true
+	if not Bridge.Enabled then
+		Util.Warn("Backend BELUM dikonfigurasi (Config.Backend). Anti-cheat tetap jalan lokal, tapi tidak ada Discord/dashboard/ban command.")
+		return
+	end
+	task.spawn(function()
+		while true do
+			task.wait(cfg.FlushSeconds + Bridge.Backoff() - 1)
+			flush("violations", 20)
+			for _ = 1, 5 do flush("audit", 1) end
+		end
+	end)
+end
+
+return Bridge
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0009">
+        <Properties>
+          <string name="Name">Economy</string>
+          <ProtectedString name="Source"><![CDATA[-- Pemantau ekonomi SINAR RP. Tidak mengubah apa pun di game: hanya membaca Attribute "Uang" & "Saldo"
+-- (yang dipantulkan modul Ekonomi) dan MENCATAT sinyal mencurigakan. Tidak pernah menghukum.
+local Players = game:GetService("Players")
+local Config = require(script.Parent.Parent.Config)
+local Permissions = require(script.Parent.Permissions)
+local Scoring = require(script.Parent.Scoring)
+
+local Economy = {}
+
+local function watch(player)
+	local C = Config.Economy
+	local last = nil
+	local window = {} -- { {waktu, kenaikan} }
+
+	local function check()
+		local u, s = player:GetAttribute("Uang"), player:GetAttribute("Saldo")
+		if u == nil or s == nil then return end -- data belum siap
+		if type(u) ~= "number" or type(s) ~= "number" or u ~= u or s ~= s or u < 0 or s < 0 or u > 1e13 or s > 1e13 then
+			-- Keadaan mustahil (NaN / negatif / raksasa): hampir pasti bug atau manipulasi data.
+			Scoring.Hit(player, "economy.invalid_state", 50, 4, { uang = tostring(u), saldo = tostring(s) })
+			return
+		end
+		local total = u + s
+		if last ~= nil and total > last then
+			local now = os.clock()
+			table.insert(window, { now, total - last })
+			local sum, keep = 0, {}
+			for _, e in ipairs(window) do
+				if now - e[1] <= C.WindowSeconds then
+					table.insert(keep, e)
+					sum += e[2]
+				end
+			end
+			window = keep
+			if sum >= C.GainThreshold then
+				window = {}
+				-- Staf yang memakai /uang sudah diaudit terpisah: beri bobot rendah agar tidak berisik.
+				local severity = Permissions.IsStaff(player) and 1 or 2
+				Scoring.Hit(player, "economy.large_gain", 15, severity, { gained = sum, window_seconds = C.WindowSeconds, staff = severity == 1 })
+			end
+		end
+		last = total
+	end
+
+	player:GetAttributeChangedSignal("Uang"):Connect(check)
+	player:GetAttributeChangedSignal("Saldo"):Connect(check)
+	check()
+end
+
+function Economy.Start()
+	if not Config.Economy.Enabled then return end
+	for _, p in ipairs(Players:GetPlayers()) do task.spawn(watch, p) end
+	Players.PlayerAdded:Connect(watch)
+end
+
+return Economy
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0010">
+        <Properties>
+          <string name="Name">Executor</string>
+          <ProtectedString name="Source"><![CDATA[-- Eksekutor perintah dari backend (Discord/dashboard/in-game): ban, unban, kick, warn, announce.
+-- Server game yang mengeksekusi. Hasil asli (berhasil/gagal) dilaporkan balik; "tercatat di DB" BUKAN bukti ban berhasil.
+local Players = game:GetService("Players")
+local MessagingService = game:GetService("MessagingService")
+local Config = require(script.Parent.Parent.Config)
+local Bridge = require(script.Parent.Bridge)
+local Integration = require(script.Parent.Integration)
+local Remotes = require(script.Parent.Remotes)
+local Scoring = require(script.Parent.Scoring)
+local Util = require(script.Parent.Util)
+
+local Executor = {}
+local TOPIC = "SmartAC_Announce"
+
+-- ---------------- Pengumuman global (best-effort, dedupe per id) ----------------
+local seen, seenOrder = {}, {}
+local function showAnnouncement(data)
+	if type(data) ~= "table" or type(data.id) ~= "string" or seen[data.id] then return end
+	if type(data.message) ~= "string" or #data.message > 200 then return end
+	seen[data.id] = true
+	table.insert(seenOrder, data.id)
+	if #seenOrder > 100 then seen[table.remove(seenOrder, 1)] = nil end
+	Remotes.Notify:FireAllClients({ kind = "announce", text = data.message, from = tostring(data.from or "Staff"):sub(1, 40) })
+end
+
+function Executor.Announce(id, message, from)
+	if Integration.Active() then
+		-- Pakai pipeline pengumuman SINAR RP: banner lokal + topic yang sama untuk server lain.
+		Integration.Banner(message, from)
+		Integration.PublishGlobal(message, from)
+		return "published"
+	end
+	local payload = { id = id, message = message, from = from }
+	local ok = pcall(function() MessagingService:PublishAsync(TOPIC, payload) end)
+	if not ok then
+		showAnnouncement(payload)
+		return "local_only"
+	end
+	task.delay(4, function() showAnnouncement(payload) end) -- cadangan jika langganan lokal tidak menerima
+	return "published"
+end
+
+-- ---------------- Config dari backend (saklar darurat jarak jauh) ----------------
+function Executor.RefreshConfig()
+	local ok, res = Bridge.Call("config", {})
+	if not ok or type(res.enforcement) ~= "table" then return end
+	-- Enforced hanya jika KEDUANYA mengizinkan: Config lokal DAN backend.
+	local backendAllows = res.enforcement.mode == "enforced" and res.enforcement.auto_kick_enabled == true
+	local effective = (not Config.AntiCheat.LockDetectOnly and Config.AntiCheat.Mode == "enforced" and backendAllows) and "enforced" or "detect_only"
+	if effective ~= Scoring.Mode then
+		Util.Log("Mode anti-cheat sekarang:", effective)
+		Scoring.Mode = effective
+	end
+end
+
+-- ---------------- Eksekusi satu perintah ----------------
+local ACTIONS = { ban = true, unban = true, kick = true, warn = true }
+
+local function execute(cmd)
+	local p = cmd.payload
+	if cmd.type == "announce_global" then
+		if type(p) ~= "table" or type(p.message) ~= "string" then return "rejected", {}, "bad_payload" end
+		return "executed", { delivery = Executor.Announce(cmd.id, p.message, p.from) }
+	elseif cmd.type == "refresh_config" then
+		Executor.RefreshConfig()
+		return "executed", {}
+	elseif cmd.type ~= "execute_action" then
+		return "rejected", {}, "unknown_command_type"
+	end
+
+	if type(p) ~= "table" or not ACTIONS[p.action_type] or type(p.target_user_id) ~= "number" or p.target_user_id % 1 ~= 0 or p.target_user_id < 1 then
+		return "rejected", {}, "bad_payload"
+	end
+	local reason = type(p.public_reason) == "string" and p.public_reason or "Pelanggaran aturan"
+	local private = (type(p.private_reason) == "string" and #p.private_reason >= 3) and p.private_reason or "Tidak ada catatan"
+
+	if p.action_type == "ban" then
+		local duration = p.is_permanent and -1 or p.duration_seconds -- -1 = permanen (terverifikasi di dokumentasi Roblox)
+		if type(duration) ~= "number" or (duration ~= -1 and duration < 1) then return "rejected", {}, "bad_duration" end
+		local ok, err = pcall(function()
+			Players:BanAsync({
+				UserIds = { p.target_user_id },
+				Duration = duration,
+				DisplayReason = reason,
+				PrivateReason = private,
+				ApplyToUniverse = true,
+				ExcludeAltAccounts = false,
+			})
+		end)
+		if not ok then return "failed", {}, "BanAsync: " .. tostring(err):sub(1, 300) end
+		return "executed", { duration = duration }
+
+	elseif p.action_type == "unban" then
+		local ok, err = pcall(function()
+			Players:UnbanAsync({ UserIds = { p.target_user_id }, ApplyToUniverse = true })
+		end)
+		if not ok then return "failed", {}, "UnbanAsync: " .. tostring(err):sub(1, 300) end
+		return "executed", {}
+
+	else -- kick / warn: hanya bisa di server tempat pemain berada
+		local target = Players:GetPlayerByUserId(p.target_user_id)
+		if not target then return "rejected", {}, "player_not_in_server" end
+		if p.action_type == "kick" then
+			target:Kick("Kamu dikeluarkan oleh staf.\nAlasan: " .. reason)
+		else
+			local n = Integration.RecordWarn(target) -- samakan hitungan warn di data SINAR RP
+			local text = n and ("PERINGATAN #" .. n .. " dari staf: " .. reason) or reason
+			if Integration.Active() then
+				Integration.Notif(target, text, "error")
+				Integration.Banner(text, "Staff", target)
+			else
+				Remotes.Notify:FireClient(target, { kind = "warning", text = reason })
+			end
+		end
+		return "executed", {}
+	end
+end
+
+local doneCache, doneOrder = {}, {}
+local function complete(id, outcome, result, err)
+	for attempt = 1, 3 do
+		local ok, res = Bridge.Call("complete", { id = id, outcome = outcome, result = result or {}, error = err })
+		if ok then return true end
+		if res == "not_lease_holder" or res == "command_not_found" then return false end
+		task.wait(2 ^ attempt)
+	end
+	return false
+end
+
+local function process(cmd)
+	if type(cmd) ~= "table" or type(cmd.id) ~= "string" then return end
+	-- Pengiriman at-least-once: jika perintah sama datang lagi, JANGAN eksekusi ulang, cukup laporkan hasil lama.
+	local cached = doneCache[cmd.id]
+	if not cached then
+		local ok, outcome, result, err = pcall(execute, cmd)
+		if not ok then
+			cached = { outcome = "failed", result = {}, err = "exception: " .. tostring(outcome):sub(1, 200) }
+		else
+			cached = { outcome = outcome, result = result, err = err }
+		end
+		doneCache[cmd.id] = cached
+		table.insert(doneOrder, cmd.id)
+		if #doneOrder > 200 then doneCache[table.remove(doneOrder, 1)] = nil end
+	end
+	Util.Debug("eksekusi", cmd.type, cmd.id:sub(1, 8), "->", cached.outcome, cached.err or "")
+	complete(cmd.id, cached.outcome, cached.result, cached.err)
+end
+
+function Executor.Start()
+	if not Bridge.Enabled then return end
+	task.spawn(function()
+		pcall(function() MessagingService:SubscribeAsync(TOPIC, function(msg) showAnnouncement(msg.Data) end) end)
+	end)
+	task.spawn(function()
+		local lastCfg = 0
+		while true do
+			local wait = Config.Backend.PollSeconds
+			if os.clock() - lastCfg > 300 then
+				lastCfg = os.clock()
+				Executor.RefreshConfig()
+			end
+			local ok, res = Bridge.Call("claim", {})
+			if ok then
+				local n = #(res.commands or {})
+				if n > 0 then Util.Debug("claim: dapat", n, "perintah") end
+				for _, cmd in ipairs(res.commands or {}) do process(cmd) end
+			else
+				wait += Bridge.Backoff()
+			end
+			task.wait(wait)
+		end
+	end)
+end
+
+return Executor
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0011">
+        <Properties>
+          <string name="Name">Exemptions</string>
+          <ProtectedString name="Source"><![CDATA[-- Pengecualian anti-cheat yang SAH. Hanya bisa diberikan oleh kode SERVER:
+--   * grace sementara (respawn, teleport game, kursi/kendaraan)
+--   * state admin (fly/noclip/teleport) yang hanya diset Admin.lua SETELAH cek izin di server.
+-- Tidak ada cara bagi client biasa untuk mengaktifkan bypass.
+local Players = game:GetService("Players")
+
+local Exemptions = {}
+local grace = {}   -- [player] = expiry (os.clock)
+local admin = {}   -- [player] = { fly=bool, noclip=bool }
+
+function Exemptions.Grant(player, seconds, _reason)
+	local untilT = os.clock() + seconds
+	if (grace[player] or 0) < untilT then
+		grace[player] = untilT
+	end
+end
+
+function Exemptions.SetAdminState(player, key, enabled)
+	admin[player] = admin[player] or {}
+	admin[player][key] = enabled or nil
+end
+
+function Exemptions.GetAdminState(player, key)
+	return admin[player] ~= nil and admin[player][key] == true
+end
+
+function Exemptions.IsExempt(player, now)
+	local g = grace[player]
+	if g and g > (now or os.clock()) then return true end
+	local a = admin[player]
+	return a ~= nil and next(a) ~= nil
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	grace[player] = nil
+	admin[player] = nil
+end)
+
+return Exemptions
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0012">
+        <Properties>
+          <string name="Name">Guard</string>
+          <ProtectedString name="Source"><![CDATA[-- RemoteGuard: bungkus RemoteEvent/RemoteFunction dengan rate limit + validasi argumen.
+-- Dipakai oleh modul SmartAC sendiri DAN oleh developer RP untuk SEMUA remote sensitif.
+--
+-- Contoh (developer RP):
+--   local Api = require(game.ServerScriptService.SmartAC.Api)
+--   local V = Api.Validate
+--   Api.Guard.Event(buyRemote, { Args = { V.String(1, 40), V.Integer(1, 10) }, PerSecond = 2, Burst = 4 },
+--     function(player, itemId, qty) ... end)  -- harga/uang/stok WAJIB dihitung di server, bukan dari client
+local Config = require(script.Parent.Parent.Config)
+local RateLimit = require(script.Parent.RateLimit)
+local Scoring = require(script.Parent.Scoring)
+
+local Guard = {}
+local D = Config.AntiCheat.Remote
+
+local function check(player, remote, opts, ...)
+	-- 1) rate limit dulu (paling murah), 2) jumlah arg, 3) tipe/batas tiap arg
+	if not RateLimit.Allow("remote:" .. remote.Name, player, opts.PerSecond or D.PerSecond, opts.Burst or D.Burst) then
+		Scoring.Hit(player, "remote.spam", 5, 1, { remote = remote.Name })
+		return false
+	end
+	local args = opts.Args or {}
+	if select("#", ...) ~= #args then
+		Scoring.Hit(player, "remote.invalid_args", 8, 2, { remote = remote.Name, reason = "arg_count" })
+		return false
+	end
+	for i, validator in ipairs(args) do
+		local value = select(i, ...)
+		if not validator(value) then
+			Scoring.Hit(player, "remote.invalid_args", 8, 2, { remote = remote.Name, reason = "arg_" .. i })
+			return false
+		end
+	end
+	return true
+end
+
+function Guard.Event(remote, opts, handler)
+	return remote.OnServerEvent:Connect(function(player, ...)
+		if not check(player, remote, opts, ...) then return end
+		local ok, err = pcall(handler, player, ...)
+		if not ok then warn("[SmartAC] handler error", remote.Name, err) end
+	end)
+end
+
+function Guard.Invoke(remoteFunction, opts, handler)
+	remoteFunction.OnServerInvoke = function(player, ...)
+		if not check(player, remoteFunction, opts, ...) then return nil end
+		local ok, result = pcall(handler, player, ...)
+		if not ok then
+			warn("[SmartAC] handler error", remoteFunction.Name, result)
+			return { ok = false, error = "internal_error" }
+		end
+		return result
+	end
+end
+
+return Guard
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0013">
+        <Properties>
+          <string name="Name">Honeypot</string>
+          <ProtectedString name="Source"><![CDATA[-- Remote jebakan: client sah tidak pernah memanggilnya. Kalau terpanggil = exploit membabi-buta.
+-- Tidak pernah menimpa remote yang sudah ada (supaya tidak merusak game RP).
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Config = require(script.Parent.Parent.Config)
+local Scoring = require(script.Parent.Scoring)
+local Util = require(script.Parent.Util)
+
+local Honeypot = {}
+
+function Honeypot.Start()
+	for _, name in ipairs(Config.AntiCheat.Honeypots) do
+		if ReplicatedStorage:FindFirstChild(name) then
+			Util.Warn(("Honeypot '%s' dilewati: sudah ada objek bernama itu di ReplicatedStorage. Ganti nama di Config."):format(name))
+		else
+			local remote = Instance.new("RemoteEvent")
+			remote.Name = name
+			remote.Parent = ReplicatedStorage
+			remote.OnServerEvent:Connect(function(player)
+				Scoring.Hit(player, "honeypot.remote", 100, 4, { remote = name }, { strong = true })
+			end)
+		end
+	end
+end
+
+return Honeypot
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0014">
+        <Properties>
+          <string name="Name">Integration</string>
+          <ProtectedString name="Source"><![CDATA[-- Jembatan ke game SINAR RP. Semua akses ke modul SINAR RP dilakukan secara malas (lazy) + pcall,
+-- jadi SmartAC tetap jalan normal kalau SINAR RP tidak ada / strukturnya berubah.
+local MessagingService = game:GetService("MessagingService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Config = require(script.Parent.Parent.Config)
+local Util = require(script.Parent.Util)
+
+local Integration = {}
+local I = Config.Integration
+
+local cache = {}
+local function sinarServerModule(name)
+	if cache[name] ~= nil then return cache[name] or nil end
+	local root = ServerScriptService:FindFirstChild("SinarRP")
+	local folder = root and root:FindFirstChild("Modul")
+	local mod = folder and folder:FindFirstChild(name)
+	local ok, res = false, nil
+	if mod then ok, res = pcall(require, mod) end
+	cache[name] = (ok and type(res) == "table") and res or false
+	return cache[name] or nil
+end
+
+function Integration.Active()
+	return I.UseSinarRP and ReplicatedStorage:FindFirstChild("SinarRP") ~= nil and ServerScriptService:FindFirstChild("SinarRP") ~= nil
+end
+
+-- ---------- Notifikasi memakai UI game SINAR RP ----------
+function Integration.Notif(player, text, kind)
+	local Net = Integration.Active() and sinarServerModule("Net")
+	if not Net then return false end
+	Net.Notif(player, text, kind or "info")
+	return true
+end
+
+-- Banner "Umumkan" milik SINAR RP. player = nil -> semua pemain di server ini.
+function Integration.Banner(text, from, player)
+	local Net = Integration.Active() and sinarServerModule("Net")
+	if not Net then return false end
+	if player then Net.Kirim(player, "Umumkan", text, from) else Net.KirimSemua("Umumkan", text, from) end
+	return true
+end
+
+-- Pakai topic yang sama dengan aplikasi Staff game (server lain menampilkannya lewat pipeline mereka).
+function Integration.PublishGlobal(text, from)
+	local ok, err = pcall(function()
+		MessagingService:PublishAsync(I.AnnounceTopic, { teks = text, dari = from, job = game.JobId })
+	end)
+	if not ok then Util.Debug("PublishAsync gagal (pengumuman hanya di server ini):", tostring(err)) end
+	return ok
+end
+
+-- Samakan penghitung peringatan di data pemain SINAR RP (d.Staf.Warn) saat warn datang dari Discord/dashboard.
+function Integration.RecordWarn(target)
+	local Data = Integration.Active() and sinarServerModule("Data")
+	if not Data or not Data.Ambil then return nil end
+	local d = Data.Ambil(target)
+	if not d then return nil end
+	d.Staf = d.Staf or { Warn = 0 }
+	d.Staf.Warn = (d.Staf.Warn or 0) + 1
+	return d.Staf.Warn
+end
+
+-- Modul Ekonomi SINAR RP (satu-satunya pintu uang). nil jika SINAR RP tidak ada.
+function Integration.Ekonomi()
+	return Integration.Active() and sinarServerModule("Ekonomi") or nil
+end
+
+return Integration
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0015">
+        <Properties>
+          <string name="Name">Movement</string>
+          <ProtectedString name="Source"><![CDATA[-- Deteksi gerakan di SERVER: speed, fly, teleport tak sah, noclip.
+-- Satu loop untuk SEMUA pemain (bukan satu loop per pemain). Data posisi tidak dikirim ke backend, hanya ringkasan insiden.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Config = require(script.Parent.Parent.Config)
+local Exemptions = require(script.Parent.Exemptions)
+local Scoring = require(script.Parent.Scoring)
+local Permissions = require(script.Parent.Permissions)
+local Whitelist = require(script.Parent.Whitelist)
+
+local Movement = {}
+local C = Config.AntiCheat
+local state = {} -- [player] = per-player state
+
+local PHYSICS_STATES = {
+	[Enum.HumanoidStateType.Ragdoll] = true,
+	[Enum.HumanoidStateType.FallingDown] = true,
+	[Enum.HumanoidStateType.GettingUp] = true,
+	[Enum.HumanoidStateType.PlatformStanding] = true,
+	[Enum.HumanoidStateType.Physics] = true,
+	[Enum.HumanoidStateType.Seated] = true,
+	[Enum.HumanoidStateType.Dead] = true,
+}
+local NOT_FLYING_STATES = {
+	[Enum.HumanoidStateType.Climbing] = true,
+	[Enum.HumanoidStateType.Swimming] = true,
+	[Enum.HumanoidStateType.Landed] = true,
+	[Enum.HumanoidStateType.Running] = true,
+	[Enum.HumanoidStateType.RunningNoPhysics] = true,
+}
+
+local function round1(n) return math.floor(n * 10 + 0.5) / 10 end
+
+local function hookPlayer(player)
+	player.CharacterAdded:Connect(function(char)
+		Exemptions.Grant(player, C.Grace.Respawn, "respawn")
+		state[player] = nil
+		local hum = char:WaitForChild("Humanoid", 10)
+		if hum then
+			hum.Seated:Connect(function()
+				Exemptions.Grant(player, C.Grace.Seat, "seat")
+			end)
+		end
+	end)
+end
+
+local function analyse(player, st, hum, hrp, now, rayParams)
+	local dt = now - st.t
+	local delta = hrp.Position - st.pos
+	local horizontal = Vector3.new(delta.X, 0, delta.Z).Magnitude
+	local vy = delta.Y / dt
+	local seated = hum.SeatPart ~= nil
+	local total = delta.Magnitude
+
+	-- Pengecualian penuh sementara: respawn, grace game, state admin, ragdoll/pingsan/PlatformStand, dsb.
+	local nonSeatPhysics = PHYSICS_STATES[hum:GetState()] == true and hum:GetState() ~= Enum.HumanoidStateType.Seated
+	if Exemptions.IsExempt(player, now) or nonSeatPhysics then
+		st.speedStrikes, st.airTime = 0, 0
+		return
+	end
+
+	-- 1) Teleport mustahil: SELALU dicek (kendaraan/whitelist hanya diberi ambang lebih tinggi).
+	local tpLimit = C.Teleport.StudsPerSecond
+	if seated then tpLimit = C.Teleport.VehicleStudsPerSecond end
+	if total > C.Teleport.MinStuds and total / dt > tpLimit then
+		Scoring.Hit(player, "movement.teleport", 30, 3, { studs = round1(total), dt = round1(dt), seated = seated })
+		return
+	end
+
+	-- Whitelist: duduk di kendaraan, memegang alat, atau berdiri di lantai khusus -> lewati speed/fly/noclip.
+	local wl = seated and "seated" or Whitelist.Reason(player, st.char, hum, hrp, rayParams)
+	if wl then
+		st.speedStrikes, st.airTime = 0, 0
+		return
+	end
+
+	-- 2) Speed horizontal
+	local allowed = math.max(hum.WalkSpeed, 16) * C.Speed.Tolerance + C.Speed.FlatBonus
+	local speed = horizontal / dt
+	if speed > allowed then
+		st.speedStrikes += 1
+		if st.speedStrikes >= C.Speed.StrikesNeeded then
+			st.speedStrikes = 0
+			Scoring.Hit(player, "movement.speed", 20, 2, { speed = round1(speed), allowed = round1(allowed), walkspeed = hum.WalkSpeed })
+		end
+	else
+		st.speedStrikes = math.max(0, st.speedStrikes - 1)
+	end
+
+	-- 3) Fly: melayang lama tanpa jatuh, atau naik terlalu cepat
+	local airborne = hum.FloorMaterial == Enum.Material.Air and not NOT_FLYING_STATES[hum:GetState()]
+	st.airTime = airborne and (st.airTime + dt) or 0
+	if st.airTime > C.Fly.AirSeconds and vy > -C.Fly.MaxFallSpeed then
+		st.airTime = 0
+		Scoring.Hit(player, "movement.fly", 25, 3, { vy = round1(vy), air_seconds = C.Fly.AirSeconds })
+	elseif vy > C.Fly.MaxUpSpeed then
+		Scoring.Hit(player, "movement.fly", 15, 2, { vy = round1(vy), kind = "fast_ascent" })
+	end
+
+	-- 4) Noclip (heuristik; bobot rendah, tidak pernah cukup sendirian)
+	if horizontal > C.Noclip.MinMove then
+		local hit = workspace:Raycast(st.pos, delta, rayParams)
+		local part = hit and hit.Instance
+		if part and part.CanCollide and part.Anchored and math.min(part.Size.X, part.Size.Y, part.Size.Z) >= 1 then
+			table.insert(st.noclip, now)
+			while #st.noclip > 0 and now - st.noclip[1] > C.Noclip.WindowSeconds do table.remove(st.noclip, 1) end
+			if #st.noclip >= C.Noclip.StrikesNeeded then
+				st.noclip = {}
+				Scoring.Hit(player, "movement.noclip", 10, 1, { through = part.Name, moved = round1(horizontal) })
+			end
+		end
+	end
+end
+
+function Movement.Start()
+	for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+	Players.PlayerAdded:Connect(hookPlayer)
+	Players.PlayerRemoving:Connect(function(p) state[p] = nil end)
+
+	local acc = 0
+	RunService.Heartbeat:Connect(function(dt)
+		acc += dt
+		if acc < C.Speed.SampleSeconds then return end
+		acc = 0
+		local now = os.clock()
+
+		local chars = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p.Character then table.insert(chars, p.Character) end
+		end
+		local rayParams = RaycastParams.new()
+		rayParams.FilterType = Enum.RaycastFilterType.Exclude
+		rayParams.FilterDescendantsInstances = chars
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local char = player.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			if hum and hrp and hum.Health > 0 and not (Config.StaffImmune and Permissions.IsStaff(player)) then
+				local st = state[player]
+				if not st or st.char ~= char then
+					state[player] = { char = char, pos = hrp.Position, t = now, speedStrikes = 0, airTime = 0, noclip = {} }
+				else
+					local ok, err = pcall(analyse, player, st, hum, hrp, now, rayParams)
+					if not ok then warn("[SmartAC] movement error:", err) end
+					st.pos, st.t = hrp.Position, now
+				end
+			else
+				state[player] = nil
+			end
+		end
+	end)
+end
+
+return Movement
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0016">
+        <Properties>
+          <string name="Name">Permissions</string>
+          <ProtectedString name="Source"><![CDATA[-- Otorisasi staff di server. Sumber kebenaran: modul Roster (dihasilkan dari staff_roster.json), berdasarkan UserId.
+-- Client TIDAK pernah dipercaya.
+--   founder / management / developer / administrator : SEMUA akses di Roblox (izin web/Discord diatur terpisah di database).
+--   helper : warn, kick, ban 1 hari, announce server, + perintah uang/status SINAR (dibatasi); tanpa teleport & VIP.
+local Roster = require(script.Parent.Parent.Roster)
+
+local Permissions = {}
+
+local RANK = { founder = 100, management = 80, developer = 70, administrator = 60, helper = 20 }
+local FULL_ACCESS = { founder = true, management = true, developer = true, administrator = true }
+-- Helper: warn, kick, ban 1 hari, announce server + perintah uang/status SINAR RP (dengan batas di Config.StaffMoney).
+-- TIDAK boleh: teleport pemain (to/bring/tp/tarik), on/off VIP, dan semua izin lain.
+local HELPER = {
+	["moderation.warn"] = true, ["moderation.kick"] = true, ["moderation.ban.temp"] = true, ["announce.server"] = true,
+	["sinar.money"] = true, ["sinar.self"] = true,
+}
+-- Izin yang LEBIH sempit dari "akses penuh": hanya role yang disebut yang boleh (berlaku untuk semua role).
+local RESTRICTED = { ["ingame.shutdown"] = { founder = true, developer = true } }
+-- Batas durasi ban (detik) per role di Roblox. Role lain tidak dibatasi di sini (backend tetap membatasi maks 365 hari).
+local MAX_BAN_SECONDS = { helper = 86400 }
+
+function Permissions.RoleOfId(userId)
+	local role = Roster.ByUserId[userId]
+	if type(role) == "string" and RANK[role] then return role end
+	return nil
+end
+function Permissions.RoleOf(player) return Permissions.RoleOfId(player.UserId) end
+function Permissions.IsStaff(player) return Permissions.RoleOfId(player.UserId) ~= nil end
+function Permissions.RankOfId(userId)
+	local role = Permissions.RoleOfId(userId)
+	return role and RANK[role] or 0
+end
+function Permissions.Rank(player) return Permissions.RankOfId(player.UserId) end
+
+function Permissions.Has(player, perm)
+	local role = Permissions.RoleOf(player)
+	if not role then return false end
+	if RESTRICTED[perm] then return RESTRICTED[perm][role] == true end
+	if FULL_ACCESS[role] then return true end
+	return role == "helper" and HELPER[perm] == true
+end
+
+-- Hanya boleh menindak yang pangkatnya LEBIH RENDAH (berlaku juga untuk staf yang sedang offline).
+function Permissions.CanTarget(actor, target) return Permissions.Rank(actor) > Permissions.Rank(target) end
+function Permissions.CanTargetId(actor, userId)
+	return actor.UserId ~= userId and Permissions.Rank(actor) > Permissions.RankOfId(userId)
+end
+
+function Permissions.MaxBanSeconds(role) return MAX_BAN_SECONDS[role] end
+
+function Permissions.List(player)
+	local role = Permissions.RoleOf(player)
+	if not role then return {} end
+	if FULL_ACCESS[role] then return { "*" } end
+	local out = {}
+	for p in pairs(HELPER) do table.insert(out, p) end
+	table.sort(out)
+	return out
+end
+
+return Permissions
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0017">
+        <Properties>
+          <string name="Name">RateLimit</string>
+          <ProtectedString name="Source"><![CDATA[-- Token bucket per (scope, player). Murah: dicek SEBELUM operasi mahal.
+local Players = game:GetService("Players")
+
+local RateLimit = {}
+local buckets = {} -- [scope] = { [player] = {tokens, last} }
+
+function RateLimit.Allow(scope, player, perSecond, burst)
+	local scopeBuckets = buckets[scope]
+	if not scopeBuckets then
+		scopeBuckets = {}
+		buckets[scope] = scopeBuckets
+	end
+	local now = os.clock()
+	local b = scopeBuckets[player]
+	if not b then
+		b = { tokens = burst, last = now }
+		scopeBuckets[player] = b
+	end
+	b.tokens = math.min(burst, b.tokens + (now - b.last) * perSecond)
+	b.last = now
+	if b.tokens < 1 then
+		return false
+	end
+	b.tokens -= 1
+	return true
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	for _, scopeBuckets in pairs(buckets) do
+		scopeBuckets[player] = nil -- tidak ada cache yang menumpuk
+	end
+end)
+
+return RateLimit
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0018">
+        <Properties>
+          <string name="Name">Remotes</string>
+          <ProtectedString name="Source"><![CDATA[-- Membuat remote yang dipakai SmartAC (dibuat oleh server saat start; tidak perlu dibuat manual di Studio).
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local folder = ReplicatedStorage:FindFirstChild("SmartACRemotes")
+if not folder then
+	folder = Instance.new("Folder")
+	folder.Name = "SmartACRemotes"
+	folder.Parent = ReplicatedStorage
+end
+
+local function make(class, name)
+	local existing = folder:FindFirstChild(name)
+	if existing then return existing end
+	local r = Instance.new(class)
+	r.Name = name
+	r.Parent = folder
+	return r
+end
+
+return {
+	Admin = make("RemoteFunction", "Admin"),
+	Notify = make("RemoteEvent", "Notify"),
+	SubmitReport = make("RemoteFunction", "SubmitReport"),
+}
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0019">
+        <Properties>
+          <string name="Name">Reports</string>
+          <ProtectedString name="Source"><![CDATA[-- Laporan pemain. Server memvalidasi target, rate limit, dan memfilter teks sebelum dikirim.
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local TextService = game:GetService("TextService")
+local Bridge = require(script.Parent.Bridge)
+local Guard = require(script.Parent.Guard)
+local Remotes = require(script.Parent.Remotes)
+local Util = require(script.Parent.Util)
+
+local V = Util.V
+local Reports = {}
+
+function Reports.Start()
+	Guard.Invoke(Remotes.SubmitReport, {
+		Args = { V.UserId, V.Enum({ "cheating", "fail_roleplay", "harassment", "other" }), V.String(5, 300) },
+		PerSecond = 0.2, Burst = 2,
+	}, function(player, targetUserId, category, description)
+		local target = Players:GetPlayerByUserId(targetUserId)
+		if not target or target == player then
+			return { ok = false, error = "invalid_target" }
+		end
+		if not Bridge.Enabled then
+			return { ok = false, error = "unavailable" }
+		end
+
+		-- Filter teks (wajib untuk teks buatan pemain)
+		local okF, filtered = pcall(function()
+			local result = TextService:FilterStringAsync(description, player.UserId, Enum.TextFilterContext.PublicChat)
+			return result:GetNonChatStringForBroadcastAsync()
+		end)
+		if not okF or type(filtered) ~= "string" then
+			return { ok = false, error = "filter_failed" }
+		end
+
+		local function pos(p)
+			local c = p.Character
+			local r = c and c:FindFirstChild("HumanoidRootPart")
+			if not r then return nil end
+			local v = r.Position
+			return { math.floor(v.X + 0.5), math.floor(v.Y + 0.5), math.floor(v.Z + 0.5) }
+		end
+		local ok, res = Bridge.Call("report", {
+			idempotency_key = HttpService:GenerateGUID(false),
+			reporter_user_id = player.UserId,
+			reported_user_id = target.UserId,
+			category = category,
+			description = filtered,
+			-- konteks agar staf bisa langsung menemukan kejadian: nama, posisi, server
+			context = {
+				reporter_name = player.Name, reported_name = target.Name,
+				reporter_pos = pos(player), reported_pos = pos(target),
+				players = #Players:GetPlayers(), max_players = Players.MaxPlayers, place_version = game.PlaceVersion,
+			},
+		})
+		if not ok then return { ok = false, error = "unavailable" } end
+		if res.outcome == "created" then
+			return { ok = true, code = res.code }
+		elseif res.outcome == "duplicate_recent" or res.outcome == "duplicate_request" then
+			return { ok = true, code = res.code, duplicate = true }
+		end
+		return { ok = false, error = res.outcome or "failed" }
+	end)
+end
+
+return Reports
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0020">
+        <Properties>
+          <string name="Name">Scoring</string>
+          <ProtectedString name="Source"><![CDATA[-- Pipeline: observe -> validate -> record evidence -> korelasi sinyal independen -> mitigasi -> catat hasil.
+-- Satu sinyal TIDAK PERNAH cukup untuk menghukum (kecuali honeypot, yang memang tidak pernah dipanggil client asli).
+-- Auto-BAN tidak ada sama sekali: yang terparah otomatis hanyalah KICK (mode enforced), ban selalu keputusan manusia.
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local Config = require(script.Parent.Parent.Config)
+local Permissions = require(script.Parent.Permissions)
+local Bridge = require(script.Parent.Bridge)
+local Util = require(script.Parent.Util)
+
+local Scoring = {}
+local C = Config.AntiCheat.Score
+local state = {} -- [player] = { score, last, detectors = {[name] = time}, emitted = {[name] = {t, suppressed}}, kicked }
+
+Scoring.Mode = Config.AntiCheat.LockDetectOnly and "detect_only" or Config.AntiCheat.Mode
+
+local function get(player)
+	local s = state[player]
+	if not s then
+		s = { score = 0, last = os.clock(), detectors = {}, emitted = {}, kicked = false }
+		state[player] = s
+	end
+	return s
+end
+
+local function distinctRecent(s, now)
+	local n = 0
+	for _, t in pairs(s.detectors) do
+		if now - t <= 60 then n += 1 end
+	end
+	return n
+end
+
+-- options.strong = true  -> sinyal yang cukup kuat sendirian (honeypot)
+function Scoring.Hit(player, detector, points, severity, evidence, options)
+	if not player or not player.Parent then return end
+	-- STAFF KEBAL: tidak dicatat, tidak dihukum (Config.StaffImmune). Hierarki staf tetap berlaku di perintah moderasi.
+	if Config.StaffImmune and Permissions.IsStaff(player) then return end
+	local now = os.clock()
+	local s = get(player)
+	s.score = math.max(0, s.score - (now - s.last) * C.DecayPerSecond) + points
+	s.last = now
+	s.detectors[detector] = now
+
+	-- Catat insiden dengan cooldown per-detector supaya tidak spam (jumlah yang ditahan ikut dicatat).
+	local e = s.emitted[detector]
+	if e and now - e.t < C.EmitCooldownSeconds then
+		e.suppressed += 1
+	else
+		local suppressed = e and e.suppressed or 0
+		s.emitted[detector] = { t = now, suppressed = 0 }
+		evidence = evidence or {}
+		evidence.suppressed_since_last = suppressed
+		evidence.total_score = math.floor(s.score * 10) / 10
+		local mitigation = nil
+
+		local kickNow = Scoring.Mode == "enforced" and not s.kicked and (
+			(options and options.strong) or
+			(s.score >= C.KickScore and distinctRecent(s, now) >= C.DistinctDetectors)
+		)
+		if kickNow then
+			s.kicked = true
+			mitigation = "kick"
+		end
+
+		Bridge.Enqueue("violations", {
+			event_key = HttpService:GenerateGUID(false), -- unik per insiden (36 karakter, batas backend 8-128)
+			user_id = player.UserId,
+			detector = detector,
+			severity = severity,
+			score = math.floor(s.score * 100) / 100,
+			mode = Scoring.Mode,
+			mitigation = mitigation,
+			evidence = evidence,
+		})
+		if mitigation == "kick" then
+			task.defer(function()
+				if player.Parent then
+					player:Kick("Aktivitas mencurigakan terdeteksi. Jika ini kesalahan, hubungi staff di Discord.")
+				end
+			end)
+		end
+		if Scoring.Mode == "detect_only" then
+			Util.Log(("[detect-only] %s (%d) -> %s sev=%d score=%.1f"):format(player.Name, player.UserId, detector, severity, s.score))
+		end
+	end
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	state[player] = nil
+end)
+
+return Scoring
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0021">
+        <Properties>
+          <string name="Name">Sessions</string>
+          <ProtectedString name="Source"><![CDATA[-- Sinkronisasi sesi pemain ke backend (batch, bukan per-event). Diperlukan agar kick/warn tahu pemain ada di server mana.
+local Players = game:GetService("Players")
+local Config = require(script.Parent.Parent.Config)
+local Bridge = require(script.Parent.Bridge)
+
+local Sessions = {}
+local keys = {}     -- [player] = session_key
+local joined, left = {}, {}
+
+local function onAdded(player)
+	local key = string.format("%s:%d:%d", Bridge.JobId, player.UserId, os.time())
+	keys[player] = key
+	table.insert(joined, { session_key = key, user_id = player.UserId, username = player.Name, display_name = player.DisplayName })
+end
+
+local function onRemoving(player)
+	local key = keys[player]
+	keys[player] = nil
+	if key then table.insert(left, { session_key = key, reason = "left" }) end
+end
+
+local function sync()
+	local online = {}
+	for _, key in pairs(keys) do table.insert(online, key) end
+	local j, l = joined, left
+	joined, left = {}, {}
+	local ok = Bridge.Call("players_sync", { joined = j, left = l, online = online })
+	if not ok then
+		-- kembalikan ke antrean (dengan batas) supaya tidak hilang saat backend sempat mati
+		for _, x in ipairs(j) do if #joined < 100 then table.insert(joined, x) end end
+		for _, x in ipairs(l) do if #left < 100 then table.insert(left, x) end end
+	end
+end
+
+function Sessions.Start()
+	if not Bridge.Enabled then return end
+	for _, p in ipairs(Players:GetPlayers()) do onAdded(p) end
+	Players.PlayerAdded:Connect(onAdded)
+	Players.PlayerRemoving:Connect(onRemoving)
+	task.spawn(function()
+		local lastBeat = 0
+		while true do
+			task.wait(Config.Backend.FlushSeconds + Bridge.Backoff() - 1)
+			if #joined > 0 or #left > 0 or os.clock() - lastBeat >= Config.Backend.HeartbeatSeconds then
+				lastBeat = os.clock()
+				-- batas 50 join/left per request sesuai batas backend
+				while #joined > 50 do table.remove(joined) end
+				while #left > 50 do table.remove(left) end
+				sync()
+			end
+		end
+	end)
+	game:BindToClose(function()
+		for _, p in ipairs(Players:GetPlayers()) do onRemoving(p) end
+		pcall(sync)
+	end)
+end
+
+return Sessions
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0022">
+        <Properties>
+          <string name="Name">Util</string>
+          <ProtectedString name="Source"><![CDATA[-- Utilitas: Maid (pembersih koneksi), validator argumen, logger.
+local Util = {}
+
+-- ---------- Maid ----------
+local Maid = {}
+Maid.__index = Maid
+
+function Util.NewMaid()
+	return setmetatable({ _items = {} }, Maid)
+end
+function Maid:Give(item)
+	table.insert(self._items, item)
+	return item
+end
+function Maid:Destroy()
+	for _, item in ipairs(self._items) do
+		local t = typeof(item)
+		if t == "RBXScriptConnection" then
+			item:Disconnect()
+		elseif t == "Instance" then
+			item:Destroy()
+		elseif t == "function" then
+			pcall(item)
+		elseif t == "table" and item.Destroy then
+			pcall(item.Destroy, item)
+		end
+	end
+	table.clear(self._items)
+end
+
+-- ---------- Validator (semua mengembalikan true/false) ----------
+local V = {}
+function V.Number(min, max)
+	return function(v)
+		return typeof(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge and v >= min and v <= max
+	end
+end
+function V.Integer(min, max)
+	local n = V.Number(min, max)
+	return function(v) return n(v) and v % 1 == 0 end
+end
+function V.String(minLen, maxLen)
+	return function(v)
+		return typeof(v) == "string" and #v >= minLen and #v <= maxLen and utf8.len(v) ~= nil
+	end
+end
+function V.Enum(list)
+	local set = {}
+	for _, x in ipairs(list) do set[x] = true end
+	return function(v) return typeof(v) == "string" and set[v] == true end
+end
+function V.Optional(check)
+	return function(v) return v == nil or check(v) end
+end
+V.Boolean = function(v) return typeof(v) == "boolean" end
+V.UserId = V.Integer(1, 1e13)
+Util.V = V
+
+function Util.Log(...)
+	print("[SmartAC]", ...)
+end
+function Util.Debug(...)
+	local ok, Config = pcall(require, script.Parent.Parent.Config)
+	if ok and Config.Debug then print("[SmartAC:debug]", ...) end
+end
+function Util.Warn(...)
+	warn("[SmartAC]", ...)
+end
+
+return Util
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0023">
+        <Properties>
+          <string name="Name">Whitelist</string>
+          <ProtectedString name="Source"><![CDATA[-- Whitelist gerakan sah: alat (Tool), kendaraan, dan lantai khusus (eskalator, lift, trampolin, dll.) yang boleh
+-- bergerak cepat / melayang. Ditandai lewat NAMA (Config.Whitelist) atau Attribute/Tag "SmartACWhitelist".
+-- Game lain juga bisa menandai karakter: character:SetAttribute("SmartACWhitelist", true) (jangan lupa dimatikan lagi).
+local CollectionService = game:GetService("CollectionService")
+local Config = require(script.Parent.Parent.Config)
+
+local Whitelist = {}
+local W = Config.Whitelist
+local TAG = W.Tag
+
+local function set(list)
+	local t = {}
+	for _, n in ipairs(list or {}) do t[string.lower(n)] = true end
+	return t
+end
+local toolNames, vehicleNames, partNames = set(W.ToolNames), set(W.VehicleNames), set(W.PartNames)
+
+local function marked(inst)
+	return inst:GetAttribute(TAG) == true or CollectionService:HasTag(inst, TAG)
+end
+
+local function partOk(part)
+	-- cek bagian itu dan dua tingkat induknya (mis. lantai eskalator di dalam model "Escalator")
+	local node = part
+	for _ = 1, 3 do
+		if not node or node == workspace then break end
+		if marked(node) or partNames[string.lower(node.Name)] then return node.Name end
+		node = node.Parent
+	end
+	return nil
+end
+
+-- Mengembalikan alasan (string) bila gerakan pemain ini di-whitelist, atau nil.
+function Whitelist.Reason(player, char, hum, hrp, rayParams)
+	if char:GetAttribute(TAG) == true or player:GetAttribute(TAG) == true then return "attribute" end
+
+	for _, child in ipairs(char:GetChildren()) do
+		if child:IsA("Tool") and (toolNames[string.lower(child.Name)] or marked(child)) then
+			return "tool:" .. child.Name
+		end
+	end
+
+	local seat = hum.SeatPart
+	if seat then
+		local model = seat:FindFirstAncestorOfClass("Model")
+		if marked(seat) or (model and (marked(model) or vehicleNames[string.lower(model.Name)])) then
+			return "vehicle:" .. (model and model.Name or seat.Name)
+		end
+	end
+
+	-- lantai di bawah kaki (eskalator/lift/trampolin/travelator)
+	local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -8, 0), rayParams)
+	if hit then
+		local name = partOk(hit.Instance)
+		if name then return "floor:" .. name end
+	end
+	return nil
+end
+
+return Whitelist
+]]></ProtectedString>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="RBX0024">
+      <Properties>
+        <string name="Name">Api</string>
+        <ProtectedString name="Source"><![CDATA[--[[
+  API untuk developer game RP. Contoh pemakaian dari script server lain:
+
+    local SmartAC = require(game.ServerScriptService.SmartAC.Api)
+
+    -- 1) Setelah game memindahkan pemain (teleport rumah/interior/spawn), beri jeda agar tidak dianggap cheat:
+    SmartAC.GrantMovementGrace(player, 3, "teleport_rumah")
+
+    -- 2) Amankan remote sensitif (WAJIB untuk uang, inventory, kendaraan, damage, job):
+    local V = SmartAC.Validate
+    SmartAC.Guard.Event(BeliBarangRemote, { Args = { V.String(1, 40), V.Integer(1, 10) }, PerSecond = 2, Burst = 4 },
+      function(player, itemId, qty)
+        -- Harga, stok, dan saldo dihitung di SERVER. Jangan percaya angka dari client.
+      end)
+
+    -- 3) Laporkan sinyal custom (mis. uang berubah tidak wajar):
+    SmartAC.Flag(player, "economy.impossible_gain", 40, 3, { gained = 1e9 })
+]]
+local HttpService = game:GetService("HttpService")
+local Bridge = require(script.Parent.Modules.Bridge)
+local Admin = require(script.Parent.Modules.Admin)
+local Integration = require(script.Parent.Modules.Integration)
+local Exemptions = require(script.Parent.Modules.Exemptions)
+local Guard = require(script.Parent.Modules.Guard)
+local Permissions = require(script.Parent.Modules.Permissions)
+local Scoring = require(script.Parent.Modules.Scoring)
+local Util = require(script.Parent.Modules.Util)
+
+local Api = {}
+Api.Guard = Guard
+Api.Validate = Util.V
+Api.NewMaid = Util.NewMaid
+
+function Api.GrantMovementGrace(player, seconds, reason)
+	Exemptions.Grant(player, math.clamp(seconds, 0, 30), reason or "game")
+end
+
+function Api.Flag(player, detector, points, severity, evidence)
+	assert(type(detector) == "string" and detector:match("^[a-z0-9_.]+$"), "detector harus huruf kecil/angka/titik/underscore")
+	Scoring.Hit(player, detector, math.clamp(points, 0, 100), math.clamp(severity, 1, 5), evidence)
+end
+
+function Api.IsStaff(player)
+	return Permissions.IsStaff(player)
+end
+
+-- Catat tindakan staf yang SUDAH dieksekusi game sendiri (mis. aplikasi Staff: warn/kick) ke riwayat moderasi backend.
+function Api.RecordStaffAction(admin, kind, target, reason)
+	if kind ~= "warn" and kind ~= "kick" then return end
+	local role = Permissions.RoleOf(admin)
+	if not role or not target then return end
+	task.spawn(function()
+		Bridge.Call("record_action", {
+			actor_user_id = admin.UserId, role_key = role, target_user_id = target.UserId, action_type = kind,
+			reason = tostring(reason or "Tindakan staf in-game"):sub(1, 400),
+			idempotency_key = HttpService:GenerateGUID(false),
+		})
+	end)
+end
+
+-- Audit perintah chat admin (/uang, /item, /kerja, ...). Dipanggil dari patch Chat.lua.
+local ADMIN_COMMANDS = { uang = true, saldo = true, item = true, jam = true, kerja = true, resetktp = true, bintang = true, spawn = true, itemadmin = true, papan = true, pingsan = true }
+function Api.AuditCommand(admin, name, args)
+	if not ADMIN_COMMANDS[name] then return end
+	local shown = {}
+	for i = 1, math.min(3, #args) do shown[i] = tostring(args[i]):sub(1, 40) end
+	Bridge.Enqueue("audit", {
+		actor_user_id = admin.UserId, role_key = Permissions.RoleOf(admin),
+		action = "ingame.cmd_" .. name, target_id = tostring(admin.UserId), details = { args = shown },
+	})
+end
+
+-- Perintah chat SINAR RP ("/setuang", "/tp", ...) diteruskan ke pipeline SmartAC supaya memakai roster, batas role, dan audit yang sama.
+local SINAR_ALIAS = { tp = "to", tarik = "bring" } -- nama SINAR -> nama perintah SmartAC
+function Api.RunSinarCommand(player, nama, args)
+	local name = SINAR_ALIAS[nama] or nama
+	local text = name
+	if args and #args > 0 then text = text .. " " .. table.concat(args, " ") end
+	local res = Admin.Run(player, text)
+	if res.message and res.message ~= "" then
+		Integration.Notif(player, res.message, res.ok and "sukses" or "error")
+	end
+	return res
+end
+
+return Api
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX0025">
+      <Properties>
+        <string name="Name">Config</string>
+        <ProtectedString name="Source"><![CDATA[--[[
+  SMART ANTICHEAT - KONFIGURASI (satu-satunya file yang perlu lu edit di sisi Roblox)
+  Letak: ServerScriptService > SmartAC > Config
+  File ini hanya ada di SERVER (tidak pernah dikirim ke client). Jangan pindahkan ke ReplicatedStorage!
+]]
+
+local Config = {}
+
+-- true = cetak log penting di Output (claim perintah, hasil eksekusi, penolakan backend). Matikan saat rilis.
+Config.Debug = true
+
+-- 1) Koneksi ke backend (isi sesuai README langkah "Hubungkan Roblox")
+Config.Backend = {
+	Url = "https://PROJECT_REF.supabase.co/functions/v1/roblox-gateway", -- ganti PROJECT_REF
+	Key = "GANTI_DENGAN_ROBLOX_GATEWAY_KEY",                             -- sama dengan secret ROBLOX_GATEWAY_KEY
+	PollSeconds = 5,       -- seberapa sering cek perintah dari Discord/dashboard
+	FlushSeconds = 5,      -- seberapa sering kirim batch insiden/audit
+	HeartbeatSeconds = 30, -- "saya masih hidup" untuk sesi pemain
+}
+
+-- 2) Daftar staff TIDAK ada di file ini. Satu-satunya sumber: staff_roster.json (root project) ->
+--    python3 tools/build_all.py -> menghasilkan modul "Roster" di folder SmartAC (+ SQL untuk Discord/web).
+--    Role: founder, management, developer, administrator (Admin), helper.
+Config.StaffImmune = true -- staff KEBAL dari anti-cheat SmartAC (tidak dicatat, tidak di-kick). Detail di README.
+
+-- 3) Anti-cheat. MODE AWAL = "detect_only" (hanya mencatat, TIDAK menghukum).
+--    Ubah ke "enforced" HANYA setelah lu cek insiden di dashboard beberapa hari dan yakin tidak ada false positive.
+Config.AntiCheat = {
+	Mode = "detect_only", -- "detect_only" | "enforced"
+	-- TERKUNCI detect-only: anti-cheat HANYA mencatat & melapor ke log staf; tidak pernah meng-kick/ban otomatis,
+	-- apa pun isi config backend. Ubah ke false HANYA bila nanti sengaja ingin membuka mode enforced (kick saja).
+	LockDetectOnly = true,
+
+	-- !!! Angka di bawah adalah titik awal yang BELUM dikalibrasi untuk game RP lu. Kalibrasi di staging. !!!
+	Speed    = { SampleSeconds = 0.25, Tolerance = 1.6, FlatBonus = 8, StrikesNeeded = 4 },
+	Fly      = { AirSeconds = 3.0, MaxFallSpeed = 25, MaxUpSpeed = 90 },
+	Teleport = { MinStuds = 80, StudsPerSecond = 500, VehicleStudsPerSecond = 1500 },
+	Noclip   = { MinMove = 4, StrikesNeeded = 3, WindowSeconds = 10 },
+	Grace    = { Respawn = 4, Seat = 1.5, Teleport = 2.5 },
+
+	-- Whitelist: alat/kendaraan/lantai yang SAH bergerak cepat atau "tidak menyentuh tanah". Item yang cocok
+	-- dikecualikan dari cek speed, fly, dan noclip (cek TELEPORT mustahil tetap berjalan).
+	-- Cara menandai: beri Attribute boolean "SmartACWhitelist = true" ATAU CollectionService tag "SmartACWhitelist"
+	-- pada Tool / model kendaraan / bagian lantai. Atau cukup daftarkan NAMA-nya di bawah (huruf besar-kecil bebas).
+	Whitelist = {
+		Tag = "SmartACWhitelist",
+		ToolNames = { "Hoverboard", "Skateboard", "Jetpack", "Parachute", "Glider", "Paraglider", "Sepeda", "Scooter" },
+		VehicleNames = {},  -- kendaraan apa pun yang DIDUDUKI (Seat/VehicleSeat) sudah otomatis dikecualikan; isi untuk menandai khusus
+		PartNames = { "Escalator", "Elevator", "Lift", "MovingPlatform", "Conveyor", "Trampoline", "JumpPad", "Eskalator" },
+	},
+
+	Score = {
+		DecayPerSecond = 0.1,
+		KickScore = 60,              -- skor minimal untuk kick (hanya mode enforced)
+		DistinctDetectors = 2,       -- butuh minimal 2 jenis sinyal berbeda dalam 60 detik (kecuali honeypot)
+		EmitCooldownSeconds = 10,    -- batasi spam insiden per jenis
+	},
+
+	Remote = { PerSecond = 10, Burst = 20 },
+
+	-- Remote jebakan: client asli TIDAK pernah memanggilnya. Ganti nama kalau bentrok dengan remote game lu.
+	Honeypots = { "GiveMoney", "AddCash", "SetAdmin", "GiveItem" },
+}
+
+-- 4) Integrasi dengan game SINAR RP (notifikasi/banner/warn memakai UI game; otomatis aktif kalau ReplicatedStorage.SinarRP ada).
+--    Daftar staf SmartAC TERPISAH dari SINAR RP (lihat staff_roster.json).
+Config.Integration = {
+	UseSinarRP = true,
+	AnnounceTopic = "SinarUmumkan", -- topic MessagingService yang SAMA dengan aplikasi Staff game lu
+}
+
+-- 5) Pemantau ekonomi (hanya MENCATAT sinyal; tidak pernah menghukum). Angka dalam Rupiah (Uang + Saldo).
+Config.Economy = {
+	Enabled = true,
+	WindowSeconds = 60,
+	GainThreshold = 5000000, -- kenaikan total >= ini dalam 1 menit dicatat (gaji normal ~32rb-200rb per 5 menit)
+}
+
+-- 6) Perintah uang/status SINAR RP (;setuang ;kasihuang ...): batas per role. Role tidak terdaftar di Caps = TANPA batas.
+Config.StaffMoney = {
+	Caps = { administrator = 1000000, helper = 500000 }, -- maks Rupiah PER PERINTAH (setuang/setsaldo/kasihuang/kasihsaldo)
+	HelperSameTargetOnce = true,        -- helper hanya boleh 1x perintah yang sama ke pemain yang sama
+	HelperSameTargetWindowHours = nil,  -- nil = selamanya; isi angka (jam) untuk membuka lagi setelah jeda itu
+	HelperCooldownSeconds = 60,         -- helper: jeda untuk perintah yang sama (grup "playtest")
+}
+
+return Config
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="Script" referent="RBX0026">
+      <Properties>
+        <string name="Name">Main</string>
+        <ProtectedString name="Source"><![CDATA[-- SmartAC: titik masuk server. Tidak perlu diedit.
+local root = script.Parent
+local Modules = root.Modules
+
+local Bridge = require(Modules.Bridge)
+local Util = require(Modules.Util)
+local Sessions = require(Modules.Sessions)
+local Honeypot = require(Modules.Honeypot)
+local Movement = require(Modules.Movement)
+local Reports = require(Modules.Reports)
+local Admin = require(Modules.Admin)
+local Executor = require(Modules.Executor)
+local Economy = require(Modules.Economy)
+local Integration = require(Modules.Integration)
+local Scoring = require(Modules.Scoring)
+require(root.Api) -- pastikan API termuat
+
+Bridge.Start()
+Sessions.Start()
+Honeypot.Start()
+Movement.Start()
+Reports.Start()
+Admin.Start()
+Executor.Start()
+Economy.Start()
+
+Util.Log(("Aktif. Mode anti-cheat: %s | Backend: %s | SINAR RP: %s"):format(Scoring.Mode, Bridge.Enabled and "dikonfigurasi" or "BELUM dikonfigurasi", Integration.Active() and "terdeteksi (staf dari ConfigOverhead)" or "tidak ada"))
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX0027">
+      <Properties>
+        <string name="Name">Roster</string>
+        <ProtectedString name="Source"><![CDATA[-- DIHASILKAN dari staff_roster.json oleh tools/build_staff.py. JANGAN edit manual (edit JSON lalu build ulang).
+-- Hanya ada di server (ServerScriptService). Identitas staff = UserId, bukan nama.
+return {
+	ByUserId = {
+		[8269411613] = "founder", -- bijibapakmuuuu
+		[11411678988] = "founder", -- asterveil_nr
+		[9188969905] = "founder", -- villainxxss
+		[8780518240] = "management", -- SagaraSkibidiw
+		[8850381377] = "management", -- jarsss06
+		[8841765649] = "administrator", -- lalalunna8
+		[1748614144] = "administrator", -- Memor1es_10
+		[8901719751] = "administrator", -- natnuy1
+		[7966279377] = "administrator", -- aku_lunareal
+		[7530260164] = "helper", -- cyezvo
+	},
+}
+]]></ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

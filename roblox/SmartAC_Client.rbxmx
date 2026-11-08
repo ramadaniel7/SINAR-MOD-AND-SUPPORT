@@ -1,0 +1,931 @@
+<roblox version="4">
+  <Item class="Folder" referent="RBX0028">
+    <Properties>
+      <string name="Name">SmartACClient</string>
+    </Properties>
+    <Item class="Folder" referent="RBX0029">
+      <Properties>
+        <string name="Name">Modules</string>
+      </Properties>
+      <Item class="ModuleScript" referent="RBX0030">
+        <Properties>
+          <string name="Name">CommandBar</string>
+          <ProtectedString name="Source"><![CDATA[-- Command bar gaya Kohl's: tekan ; untuk membuka, ketik perintah, saran muncul (Tab = lengkapi, ↑/↓ = pilih, Enter = jalankan).
+-- Client hanya MENGIRIM teks ke server; server yang mem-parse, mengotorisasi, dan mengeksekusi.
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Theme = require(script.Parent.Theme)
+local UI = require(script.Parent.UI)
+local Maid = require(script.Parent.Maid)
+
+local CommandBar = {}
+local MAX_ROWS = 6
+local SELECTORS = { "me", "all", "others", "random", "admins", "nonadmins" }
+local DURATIONS = { "1d", "1w", "30d", "365d", "perm" }
+
+local function stripPrefix(s) return (s:gsub("^%s*[;:]?%s*", "")) end
+
+function CommandBar.new(gui, remote, catalog, onClientAction)
+	local self = {}
+	local maid = Maid.new()
+	local byName = {}
+	for _, c in ipairs(catalog) do
+		byName[c.name] = c
+		for _, a in ipairs(c.aliases) do byName[a] = c end
+	end
+	local history, histIdx = {}, 0
+	local suggestions, sel = {}, 0
+	local resultToken = 0
+	local busy = false
+
+	-- ---------- kerangka ----------
+	local root = UI.Frame({
+		Parent = gui, Name = "SmartACBar", Visible = false, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10),
+		Size = UDim2.new(0.92, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, ZIndex = 20,
+	}, { UI.New("UISizeConstraint", { MaxSize = Vector2.new(540, 9999) }), UI.New("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+	maid:Give(root)
+
+	local bar = UI.Frame({ Parent = root, Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = Theme.bg, BackgroundTransparency = 0.08, LayoutOrder = 1 }, { UI.Corner(12), UI.Stroke(Theme.stroke, 1) })
+	UI.Label({ Parent = bar, Text = ";", Font = Theme.fontBold, TextSize = 20, TextColor3 = Theme.accent, Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(0, 14, 1, 0) })
+	local box = UI.New("TextBox", {
+		Parent = bar, BackgroundTransparency = 1, Position = UDim2.new(0, 32, 0, 0), Size = UDim2.new(1, -44, 1, 0), Font = Enum.Font.RobotoMono, TextSize = 16,
+		TextColor3 = Theme.text, PlaceholderText = "ketik perintah… (;help)", PlaceholderColor3 = Theme.sub, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, Text = "",
+	})
+
+	local list = UI.Frame({ Parent = root, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Theme.bg, BackgroundTransparency = 0.08, LayoutOrder = 2, Visible = false }, {
+		UI.Corner(12), UI.Stroke(Theme.stroke, 1), UI.Pad(6), UI.New("UIListLayout", { Padding = UDim.new(0, 2) }),
+	})
+	local rows, rowHints = {}, {}
+	for i = 1, MAX_ROWS do
+		local r = UI.New("TextButton", { Parent = list, Visible = false, Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, AutoButtonColor = false,
+			Font = Theme.fontBold, TextSize = 14, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left, Text = "", LayoutOrder = i }, { UI.Corner(8), UI.New("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+		local hint = UI.Label({ Parent = r, Size = UDim2.new(0.6, -10, 1, 0), Position = UDim2.new(0.4, 0, 0, 0), TextXAlignment = Enum.TextXAlignment.Right, TextSize = 12, TextColor3 = Theme.sub, TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd })
+		rows[i], rowHints[i] = r, hint
+	end
+
+	local resultBox = UI.Frame({ Parent = root, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Theme.bg, BackgroundTransparency = 0.08, LayoutOrder = 3, Visible = false },
+		{ UI.Corner(12), UI.Stroke(Theme.stroke, 1), UI.Pad(10) })
+	local resultLabel = UI.Label({ Parent = resultBox, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Text = "", TextSize = 14, RichText = false })
+
+	local function updateVisible()
+		root.Visible = bar.Visible or resultBox.Visible
+	end
+
+	local function showResult(text, ok, seconds)
+		resultToken += 1
+		local mine = resultToken
+		resultLabel.Text = text
+		resultLabel.TextColor3 = ok and Theme.good or Theme.bad
+		resultBox.Visible = text ~= ""
+		updateVisible()
+		task.delay(seconds or 6, function()
+			if resultToken == mine then resultBox.Visible = false updateVisible() end
+		end)
+	end
+
+	-- ---------- saran ----------
+	local function render()
+		list.Visible = #suggestions > 0 and bar.Visible
+		for i = 1, MAX_ROWS do
+			local s = suggestions[i]
+			local r = rows[i]
+			if s then
+				r.Visible = true
+				r.Text = s.label
+				rowHints[i].Text = s.hint or ""
+				local on = (i == sel)
+				UI.Tween(r, { BackgroundTransparency = on and 0 or 1 })
+				r.TextColor3 = on and Color3.new(0, 0, 0) or Theme.text
+				rowHints[i].TextColor3 = on and Color3.fromRGB(70, 70, 70) or Theme.sub
+			else
+				r.Visible = false
+			end
+		end
+	end
+
+	local function currentToken()
+		local t = stripPrefix(box.Text)
+		local tokens = {}
+		for tok in t:gmatch("%S+") do table.insert(tokens, tok) end
+		local trailing = t:match("%s$") ~= nil or t == ""
+		return t, tokens, trailing
+	end
+
+	local function refresh()
+		local _, tokens, trailing = currentToken()
+		local n = #tokens
+		suggestions, sel = {}, 0
+		if n == 0 or (n == 1 and not trailing) then
+			local q = (tokens[1] or ""):lower()
+			for _, c in ipairs(catalog) do
+				local hit = q == "" or c.name:sub(1, #q) == q
+				if not hit then for _, a in ipairs(c.aliases) do if a:sub(1, #q) == q then hit = true end end end
+				if hit then
+					table.insert(suggestions, { label = c.name, hint = (c.usage:gsub("^%S+%s*", "")), insert = c.name .. " " })
+				end
+				if #suggestions >= MAX_ROWS then break end
+			end
+		else
+			local c = byName[tokens[1]:lower()]
+			if c then
+				local argIdx = trailing and n or (n - 1)
+				local spec = c.args[argIdx]
+				local cur = (not trailing) and tokens[n]:lower() or ""
+				local pool = {}
+				if spec then
+					if spec.type == "players" or spec.type == "player" or spec.type == "userid" then
+						for _, s in ipairs(SELECTORS) do
+							if spec.type == "players" or s == "me" or s == "random" then table.insert(pool, { s, "selector" }) end
+						end
+						for _, p in ipairs(Players:GetPlayers()) do table.insert(pool, { p.Name, p.DisplayName ~= p.Name and p.DisplayName or "pemain" }) end
+					elseif spec.type == "duration" then
+						for _, d in ipairs(DURATIONS) do table.insert(pool, { d, d == "perm" and "butuh persetujuan" or "durasi" }) end
+					elseif spec.type == "onoff" then
+						pool = { { "on", "" }, { "off", "" } }
+					elseif spec.type == "enum" then
+						for _, v in ipairs(spec.values or {}) do table.insert(pool, { v, "pilihan" }) end
+					end
+				end
+				for _, e in ipairs(pool) do
+					if cur == "" or e[1]:lower():sub(1, #cur) == cur then
+						table.insert(suggestions, { label = e[1], hint = e[2], insert = e[1] .. " ", arg = true })
+						if #suggestions >= MAX_ROWS then break end
+					end
+				end
+				if #suggestions == 0 then
+					table.insert(suggestions, { label = c.usage, hint = c.desc })
+				end
+			end
+		end
+		render()
+	end
+
+	local function accept(s)
+		if not s or not s.insert then return end
+		local t, _, trailing = currentToken()
+		if trailing then box.Text = t .. s.insert else box.Text = (t:gsub("%S+$", "")) .. s.insert end
+		box.CursorPosition = #box.Text + 1
+	end
+
+	-- ---------- eksekusi ----------
+	local function submit()
+		local text = stripPrefix(box.Text)
+		if text == "" or busy then return end
+		busy = true
+		table.insert(history, text)
+		if #history > 30 then table.remove(history, 1) end
+		histIdx = #history + 1
+		box.Text = ""
+		bar.Visible = false
+		list.Visible = false
+		updateVisible()
+		showResult("…", true, 15)
+		local ok, res = pcall(function() return remote:InvokeServer("run", { text = text }) end)
+		busy = false
+		if not ok or type(res) ~= "table" then showResult("Gagal terhubung ke server.", false) return end
+		if res.error == "denied" then showResult("Ditolak.", false) return end
+		showResult(res.message ~= "" and res.message or (res.ok and "OK" or "Gagal"), res.ok == true, #(res.message or "") > 120 and 14 or 6)
+		if res.ok and type(res.client) == "table" and onClientAction then onClientAction(res.client) end
+	end
+
+	-- ---------- input ----------
+	maid:Give(box:GetPropertyChangedSignal("Text"):Connect(refresh))
+	maid:Give(box.FocusLost:Connect(function(enter)
+		if enter then
+			submit()
+		else
+			task.delay(0.1, function() if not box:IsFocused() then bar.Visible = false list.Visible = false updateVisible() end end)
+		end
+	end))
+	maid:Give(UserInputService.InputBegan:Connect(function(input)
+		if not box:IsFocused() then return end
+		local k = input.KeyCode
+		if k == Enum.KeyCode.Tab then
+			accept(suggestions[math.max(sel, 1)])
+		elseif k == Enum.KeyCode.Down or k == Enum.KeyCode.Up then
+			local dir = (k == Enum.KeyCode.Down) and 1 or -1
+			if #suggestions > 0 and not (k == Enum.KeyCode.Up and sel == 0 and #history > 0 and box.Text == "") then
+				sel = ((sel - 1 + dir) % #suggestions) + 1
+				render()
+			elseif #history > 0 then
+				histIdx = math.clamp(histIdx + dir, 1, #history + 1)
+				box.Text = history[histIdx] or ""
+				box.CursorPosition = #box.Text + 1
+			end
+		end
+	end))
+	for i, r in ipairs(rows) do
+		maid:Give(r.MouseButton1Click:Connect(function() accept(suggestions[i]) box:CaptureFocus() end))
+	end
+
+	function self.Open(prefill)
+		bar.Visible = true
+		updateVisible()
+		task.defer(function()
+			box:CaptureFocus()
+			task.wait()
+			box.Text = prefill or ""
+			box.CursorPosition = #box.Text + 1
+			refresh()
+		end)
+	end
+	function self.Toggle()
+		if bar.Visible then box:ReleaseFocus() bar.Visible = false list.Visible = false updateVisible() else self.Open() end
+	end
+	function self.Notify(text, ok) showResult(text, ok, 6) end
+	function self.Destroy() maid:Destroy() end
+	return self
+end
+
+return CommandBar
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0031">
+        <Properties>
+          <string name="Name">Dashboard</string>
+          <ProtectedString name="Source"><![CDATA[-- Dashboard gaya Kohl's: jendela dengan tab Perintah / Pemain / Log / Info. Semua aksi lewat command bar (satu jalur otorisasi di server).
+local Players = game:GetService("Players")
+local Theme = require(script.Parent.Theme)
+local UI = require(script.Parent.UI)
+local Maid = require(script.Parent.Maid)
+
+local Dashboard = {}
+
+function Dashboard.new(gui, remote, catalog, info, bar)
+	local self = {}
+	local maid = Maid.new()
+	local has = {}
+	for _, c in ipairs(catalog) do has[c.name] = true end
+
+	local root = UI.Frame({
+		Parent = gui, Name = "SmartACDashboard", Visible = false, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(0.94, 0, 0.82, 0), BackgroundColor3 = Theme.bg, BackgroundTransparency = 0.08, ZIndex = 10,
+	}, { UI.Corner(12), UI.Stroke(Theme.stroke, 1), UI.New("UISizeConstraint", { MaxSize = Vector2.new(720, 460), MinSize = Vector2.new(320, 300) }) })
+	maid:Give(root)
+
+	UI.Label({ Parent = root, Position = UDim2.new(0, 14, 0, 8), Size = UDim2.new(1, -60, 0, 24), Font = Theme.fontBold, TextSize = 16, Text = ("Smart Anticheat · %s"):format(info.role or "?") })
+	UI.Button(maid, { Parent = root, Text = "✕", Size = UDim2.new(0, 30, 0, 26), Position = UDim2.new(1, -40, 0, 8), BackgroundColor3 = Theme.panel2 }, function() root.Visible = false end)
+
+	-- sidebar
+	local side = UI.Frame({ Parent = root, Position = UDim2.new(0, 8, 0, 42), Size = UDim2.new(0, 108, 1, -50), BackgroundTransparency = 1 }, { UI.New("UIListLayout", { Padding = UDim.new(0, 4) }) })
+	local pages, tabButtons = {}, {}
+	local function show(name)
+		for key, p in pairs(pages) do p.Visible = key == name end
+		for key, b in pairs(tabButtons) do
+			local on = key == name
+			UI.Tween(b, { BackgroundTransparency = on and 0 or 1 })
+			b.TextColor3 = on and Color3.new(0, 0, 0) or Theme.text
+		end
+	end
+	local function page()
+		return UI.Frame({ Parent = root, Position = UDim2.new(0, 124, 0, 42), Size = UDim2.new(1, -132, 1, -50), BackgroundTransparency = 1, Visible = false })
+	end
+	local function tab(key, label)
+		local b = UI.New("TextButton", { Parent = side, Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, AutoButtonColor = false,
+			Font = Theme.fontBold, TextSize = 14, TextColor3 = Theme.text, Text = label, LayoutOrder = #side:GetChildren() }, { UI.Corner(8) })
+		tabButtons[key] = b
+		maid:Give(b.MouseButton1Click:Connect(function() show(key) end))
+		pages[key] = page()
+		return pages[key]
+	end
+
+	-- ===== Perintah =====
+	local pc = tab("cmd", "Perintah")
+	local search = UI.Box({ Parent = pc, PlaceholderText = "Cari perintah…", Size = UDim2.new(1, 0, 0, 30), Text = "" })
+	local cmdList = UI.Scroll({ Parent = pc, Position = UDim2.new(0, 0, 0, 36), Size = UDim2.new(1, 0, 1, -36) })
+	local function renderCommands()
+		for _, c in ipairs(cmdList:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+		local q = search.Text:lower()
+		for i, c in ipairs(catalog) do
+			if q == "" or c.name:find(q, 1, true) or c.group:find(q, 1, true) or c.desc:lower():find(q, 1, true) then
+				local b = UI.New("TextButton", { Parent = cmdList, LayoutOrder = i, Size = UDim2.new(1, -6, 0, 44), BackgroundColor3 = Theme.panel, BackgroundTransparency = 0.3, AutoButtonColor = false,
+					Font = Theme.fontBold, TextSize = 14, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left, Text = "", }, { UI.Corner(8), UI.New("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+				UI.Label({ Parent = b, Size = UDim2.new(1, -10, 0, 22), Text = ";" .. c.usage, Font = Enum.Font.RobotoMono, TextSize = 13, TextWrapped = false })
+				UI.Label({ Parent = b, Position = UDim2.new(0, 0, 0, 22), Size = UDim2.new(1, -10, 0, 18), Text = ("[%s] %s"):format(c.group, c.desc), TextSize = 12, TextColor3 = Theme.sub, TextWrapped = false })
+				b.MouseButton1Click:Connect(function() root.Visible = false bar.Open(c.name .. " ") end)
+			end
+		end
+	end
+	maid:Give(search:GetPropertyChangedSignal("Text"):Connect(renderCommands))
+
+	-- ===== Pemain =====
+	local pp = tab("plr", "Pemain")
+	local plrList = UI.Scroll({ Parent = pp, Size = UDim2.new(1, 0, 1, 0) })
+	local function renderPlayers()
+		local ok, res = pcall(function() return remote:InvokeServer("players", {}) end)
+		for _, c in ipairs(plrList:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+		if not ok or type(res) ~= "table" or not res.ok then return end
+		for i, p in ipairs(res.players) do
+			local card = UI.Frame({ Parent = plrList, LayoutOrder = i, Size = UDim2.new(1, -6, 0, 70), BackgroundColor3 = Theme.panel, BackgroundTransparency = 0.3 }, { UI.Corner(8), UI.Pad(6) })
+			UI.Label({ Parent = card, Size = UDim2.new(1, 0, 0, 20), Font = Theme.fontBold, Text = ("%s (@%s)%s"):format(p.displayName, p.name, p.staff and ("  [" .. p.staff .. "]") or ""), TextWrapped = false })
+			local actions = UI.Frame({ Parent = card, Position = UDim2.new(0, 0, 0, 26), Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, { UI.New("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }) })
+			for _, a in ipairs({ { "to", "Goto", "to %s" }, { "bring", "Bring", "bring %s" }, { "view", "View", "view %s" }, { "warn", "Warn", "warn %s " }, { "kick", "Kick", "kick %s " }, { "ban", "Ban", "ban %s 1d " } }) do
+				if has[a[1]] and p.userId ~= Players.LocalPlayer.UserId then
+					UI.Button(maid, { Parent = actions, Text = a[2], Size = UDim2.new(0, 50, 1, 0), TextSize = 12, BackgroundColor3 = Theme.panel2 }, function()
+						root.Visible = false
+						bar.Open(a[3]:format(p.name))
+					end)
+				end
+			end
+		end
+	end
+
+	-- ===== Log =====
+	local lp = tab("log", "Log")
+	local logLabel = UI.Label({ Parent = lp, Size = UDim2.new(1, 0, 1, -34), Position = UDim2.new(0, 0, 0, 34), Font = Enum.Font.RobotoMono, TextSize = 12, TextYAlignment = Enum.TextYAlignment.Top, Text = "" })
+	local function renderLogs()
+		local ok, res = pcall(function() return remote:InvokeServer("logs", {}) end)
+		logLabel.Text = (ok and type(res) == "table" and res.ok and #res.lines > 0) and table.concat(res.lines, "\n") or "Belum ada perintah di server ini."
+	end
+	UI.Button(maid, { Parent = lp, Text = "Segarkan", Size = UDim2.new(0, 100, 0, 28), BackgroundColor3 = Theme.panel2 }, renderLogs)
+
+	-- ===== Info =====
+	local ip = tab("info", "Info")
+	UI.Label({ Parent = ip, Size = UDim2.new(1, 0, 1, 0), TextYAlignment = Enum.TextYAlignment.Top, TextSize = 14, Text = table.concat({
+		("Role: %s  (rank %s)"):format(tostring(info.role), tostring(info.rank)),
+		(info.perms and info.perms[1] == "*") and "Izin: SEMUA (akses penuh di Roblox)" or ("Izin aktif: %d (%s)"):format(#(info.perms or {}), table.concat(info.perms or {}, ", ")),
+		"",
+		"Pintasan:",
+		"  ;  = buka command bar     F4 = dashboard ini",
+		"  Tab = lengkapi saran   ↑/↓ = pilih / riwayat   Enter = jalankan",
+		"",
+		"Selector pemain: me, all, others, random, admins, nonadmins, atau nama (sebagian)",
+		"Durasi ban: 1d, 1w, 30d, 365d, perm (perm butuh persetujuan orang lain)",
+		"",
+		"Semua perintah berdampak dicatat (audit) ke backend.",
+	}, "\n") })
+
+	function self.Toggle()
+		root.Visible = not root.Visible
+		if root.Visible then renderCommands() renderPlayers() renderLogs() show("cmd") end
+	end
+	function self.Destroy() maid:Destroy() end
+	show("cmd")
+	return self
+end
+
+return Dashboard
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0032">
+        <Properties>
+          <string name="Name">Maid</string>
+          <ProtectedString name="Source"><![CDATA[-- Pembersih koneksi/instance/tween. Satu Maid per komponen UI; Destroy() membersihkan semuanya.
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+	return setmetatable({ _items = {} }, Maid)
+end
+function Maid:Give(item)
+	table.insert(self._items, item)
+	return item
+end
+function Maid:Destroy()
+	for _, item in ipairs(self._items) do
+		local t = typeof(item)
+		if t == "RBXScriptConnection" then
+			item:Disconnect()
+		elseif t == "Instance" then
+			item:Destroy()
+		elseif t == "function" then
+			pcall(item)
+		elseif t == "table" and item.Destroy then
+			pcall(item.Destroy, item)
+		end
+	end
+	table.clear(self._items)
+end
+return Maid
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0033">
+        <Properties>
+          <string name="Name">Notify</string>
+          <ProtectedString name="Source"><![CDATA[-- Menampilkan pengumuman (toast) dan peringatan staff (kartu tengah layar). Data dari server divalidasi dulu.
+local Theme = require(script.Parent.Theme)
+local UI = require(script.Parent.UI)
+local Maid = require(script.Parent.Maid)
+
+local Notify = {}
+local MAX_TOASTS = 4
+
+function Notify.new(gui, remote)
+	local self = {}
+	local maid = Maid.new()
+
+	local container = UI.New("Frame", {
+		Name = "Toasts", Parent = gui, BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 12), Size = UDim2.new(0, 420, 1, -24),
+	}, { UI.New("UIListLayout", { Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Center }) })
+	maid:Give(container)
+
+	local function toast(title, text, color, seconds)
+		local children = container:GetChildren()
+		local count = 0
+		for _, c in ipairs(children) do if c:IsA("Frame") then count += 1 end end
+		if count >= MAX_TOASTS then
+			for _, c in ipairs(children) do if c:IsA("Frame") then c:Destroy() break end end
+		end
+		local card = UI.Frame({ Parent = container, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, {
+			UI.Corner(), UI.Stroke(color, 1.5), UI.Pad(10),
+			UI.New("UIListLayout", { Padding = UDim.new(0, 2) }),
+		})
+		UI.Label({ Parent = card, Text = title, Font = Theme.fontBold, TextColor3 = color, Size = UDim2.new(1, 0, 0, 18), TextTransparency = 1 })
+		UI.Label({ Parent = card, Text = text, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextTransparency = 1 })
+		UI.Tween(card, { BackgroundTransparency = 0.05 })
+		for _, l in ipairs(card:GetChildren()) do if l:IsA("TextLabel") then UI.Tween(l, { TextTransparency = 0 }) end end
+		task.delay(seconds, function()
+			if card.Parent then
+				UI.Tween(card, { BackgroundTransparency = 1 })
+				task.delay(0.2, function() if card.Parent then card:Destroy() end end)
+			end
+		end)
+	end
+
+	local function warning(text)
+		local overlay = UI.Frame({ Parent = gui, Name = "SmartACWarning", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.5, ZIndex = 50 })
+		local card = UI.Frame({ Parent = overlay, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(0, 400, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 51 }, {
+			UI.Corner(12), UI.Stroke(Theme.warn, 2), UI.Pad(16), UI.New("UIListLayout", { Padding = UDim.new(0, 10) }),
+		})
+		UI.Label({ Parent = card, Text = "⚠ PERINGATAN DARI STAFF", Font = Theme.fontBold, TextSize = 18, TextColor3 = Theme.warn, Size = UDim2.new(1, 0, 0, 24), ZIndex = 52 })
+		UI.Label({ Parent = card, Text = text, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 52 })
+		local localMaid = Maid.new()
+		local close = UI.Button(localMaid, { Parent = card, Text = "Saya mengerti", Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.accent, ZIndex = 52 }, function()
+			localMaid:Destroy()
+			overlay:Destroy()
+		end)
+		task.delay(30, function() if overlay.Parent then localMaid:Destroy() overlay:Destroy() end end)
+		return close
+	end
+
+	maid:Give(remote.OnClientEvent:Connect(function(data)
+		if type(data) ~= "table" or type(data.text) ~= "string" or #data.text > 400 then return end
+		if data.kind == "announce" then
+			toast("📢 Pengumuman — " .. tostring(data.from or "Staff"):sub(1, 40), data.text, Theme.accent, 9)
+		elseif data.kind == "warning" then
+			warning(data.text)
+		end
+	end))
+
+	function self.Toast(title, text, color, seconds) toast(title, text, color or Theme.accent, seconds or 4) end
+	function self.Destroy() maid:Destroy() end
+	return self
+end
+
+return Notify
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0034">
+        <Properties>
+          <string name="Name">ReportUI</string>
+          <ProtectedString name="Source"><![CDATA[-- Form laporan pemain. Server yang memvalidasi target, rate limit, dan memfilter teks.
+local Players = game:GetService("Players")
+local Theme = require(script.Parent.Theme)
+local UI = require(script.Parent.UI)
+local Maid = require(script.Parent.Maid)
+
+local ReportUI = {}
+local CATEGORIES = { { "cheating", "Cheat/Exploit" }, { "fail_roleplay", "Fail RP" }, { "harassment", "Pelecehan" }, { "other", "Lainnya" } }
+
+function ReportUI.new(gui, remote)
+	local self = {}
+	local maid = Maid.new()
+	local target, category, sending = nil, "cheating", false
+
+	local root = UI.Frame({
+		Parent = gui, Name = "SmartACReport", Visible = false, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(0.9, 0, 0.8, 0), BackgroundColor3 = Theme.bg,
+	}, { UI.Corner(12), UI.Stroke(Theme.stroke, 1.5), UI.New("UISizeConstraint", { MaxSize = Vector2.new(460, 460), MinSize = Vector2.new(300, 300) }), UI.Pad(12) })
+	maid:Give(root)
+
+	UI.Label({ Parent = root, Text = "Laporkan pemain", Font = Theme.fontBold, TextSize = 18, Size = UDim2.new(1, -40, 0, 24) })
+	UI.Button(maid, { Parent = root, Text = "✕", Size = UDim2.new(0, 28, 0, 24), Position = UDim2.new(1, -28, 0, 0) }, function() root.Visible = false end)
+	UI.Label({ Parent = root, Position = UDim2.new(0, 0, 0, 28), Size = UDim2.new(1, 0, 0, 30), TextSize = 12, TextColor3 = Theme.sub, Text = "Laporan palsu/spam bisa berujung sanksi. Staff akan memverifikasi sebelum bertindak." })
+
+	local list = UI.Scroll({ Parent = root, Position = UDim2.new(0, 0, 0, 62), Size = UDim2.new(1, 0, 0, 100) })
+	local catRow = UI.New("Frame", { Parent = root, BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0, 170), Size = UDim2.new(1, 0, 0, 30) }, {
+		UI.New("UIGridLayout", { CellSize = UDim2.new(0.25, -4, 1, 0), CellPadding = UDim2.new(0, 4, 0, 0) }),
+	})
+	local catButtons = {}
+	for _, c in ipairs(CATEGORIES) do
+		catButtons[c[1]] = UI.Button(maid, { Parent = catRow, Text = c[2], TextSize = 12, BackgroundColor3 = c[1] == category and Theme.accent or Theme.panel2 }, function()
+			category = c[1]
+			for key, b in pairs(catButtons) do UI.Tween(b, { BackgroundColor3 = key == category and Theme.accent or Theme.panel2 }) end
+		end)
+	end
+
+	local desc = UI.Box({ Parent = root, PlaceholderText = "Jelaskan kejadiannya (5–300 karakter)", Position = UDim2.new(0, 0, 0, 208), Size = UDim2.new(1, 0, 0, 100),
+		MultiLine = true, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, Text = "" })
+	local status = UI.Label({ Parent = root, Position = UDim2.new(0, 0, 0, 350), Size = UDim2.new(1, 0, 0, 36), TextSize = 13, TextColor3 = Theme.sub, Text = "" })
+
+	local rows, rowConns = {}, {}
+	local function renderPlayers()
+		for _, c in ipairs(rowConns) do c:Disconnect() end
+		table.clear(rowConns)
+		for _, r in ipairs(rows) do r:Destroy() end
+		table.clear(rows)
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= Players.LocalPlayer then
+				local b = UI.New("TextButton", { Parent = list, Size = UDim2.new(1, -4, 0, 26), BackgroundColor3 = (target == p.UserId) and Theme.accent or Theme.panel2, AutoButtonColor = false, BorderSizePixel = 0,
+					Font = Theme.font, TextSize = 13, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left, Text = p.DisplayName .. " (@" .. p.Name .. ")" },
+					{ UI.Corner(6), UI.New("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
+				table.insert(rows, b)
+				table.insert(rowConns, b.MouseButton1Click:Connect(function() target = p.UserId renderPlayers() end))
+			end
+		end
+	end
+
+	local submit
+	submit = UI.Button(maid, { Parent = root, Text = "Kirim laporan", Position = UDim2.new(0, 0, 1, -34), Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.accent }, function()
+		if sending then return end
+		if not target then status.Text = "Pilih pemain yang dilaporkan." status.TextColor3 = Theme.warn return end
+		if #desc.Text < 5 then status.Text = "Deskripsi minimal 5 karakter." status.TextColor3 = Theme.warn return end
+		sending = true
+		submit.Text = "Mengirim…"
+		local ok, res = pcall(function() return remote:InvokeServer(target, category, string.sub(desc.Text, 1, 300)) end)
+		sending = false
+		submit.Text = "Kirim laporan"
+		if ok and type(res) == "table" and res.ok then
+			status.Text = "✓ Laporan terkirim. Kode: " .. tostring(res.code) .. (res.duplicate and " (laporan serupa sudah ada)" or "")
+			status.TextColor3 = Theme.good
+			desc.Text = ""
+		else
+			local err = ok and type(res) == "table" and res.error or "gagal"
+			status.Text = "✗ " .. (err == "rate_limited" and "Terlalu banyak laporan, coba lagi nanti." or "Laporan gagal dikirim (" .. tostring(err) .. ").")
+			status.TextColor3 = Theme.bad
+		end
+	end)
+
+	maid:Give(Players.PlayerAdded:Connect(function() if root.Visible then renderPlayers() end end))
+	maid:Give(Players.PlayerRemoving:Connect(function(p) if p.UserId == target then target = nil end task.defer(function() if root.Visible then renderPlayers() end end) end))
+
+	function self.Toggle()
+		root.Visible = not root.Visible
+		if root.Visible then status.Text = "" renderPlayers() end
+	end
+	function self.Destroy() for _, c in ipairs(rowConns) do c:Disconnect() end maid:Destroy() end
+	return self
+end
+
+return ReportUI
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0035">
+        <Properties>
+          <string name="Name">Theme</string>
+          <ProtectedString name="Source"><![CDATA[-- Token desain terpusat (warna, tipografi, jarak). Ubah di sini untuk mengganti tampilan seluruh UI.
+local theme = {
+	bg = Color3.fromRGB(17, 19, 25),
+	panel = Color3.fromRGB(26, 29, 38),
+	panel2 = Color3.fromRGB(35, 39, 50),
+	hover = Color3.fromRGB(48, 54, 69),
+	stroke = Color3.fromRGB(58, 64, 80),
+	text = Color3.fromRGB(236, 239, 246),
+	sub = Color3.fromRGB(150, 158, 176),
+	accent = Color3.fromRGB(64, 140, 255),
+	good = Color3.fromRGB(70, 200, 130),
+	warn = Color3.fromRGB(240, 180, 60),
+	bad = Color3.fromRGB(235, 90, 90),
+	font = Enum.Font.GothamMedium,
+	fontBold = Enum.Font.GothamBold,
+	size = 14,
+	radius = 8,
+	tween = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+}
+
+-- Ikuti tema game SINAR RP supaya tampilan seragam (kalau Config.Tema ada).
+pcall(function()
+	local T = require(game:GetService("ReplicatedStorage").SinarRP.Config).Tema
+	if type(T) ~= "table" then return end
+	theme.bg = T.Latar or theme.bg
+	theme.panel = T.LatarTebal or theme.panel
+	theme.panel2 = (T.LatarTebal and T.LatarTebal:Lerp(Color3.new(1, 1, 1), 0.06)) or theme.panel2
+	theme.accent = T.Aksen or theme.accent
+	theme.text = T.Teks or theme.text
+	theme.sub = T.TeksRedup or theme.sub
+	theme.good = T.Sukses or theme.good
+	theme.bad = T.Bahaya or theme.bad
+	theme.warn = T.Peringatan or theme.warn
+	theme.font = T.Font or theme.font
+end)
+
+return theme
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0036">
+        <Properties>
+          <string name="Name">Tools</string>
+          <ProtectedString name="Source"><![CDATA[-- Alat admin sisi client: fly, noclip, spectate, ESP. Semuanya HANYA aktif setelah server menyetujui (lihat AdminPanel).
+-- Loop hanya berjalan saat fitur aktif dan semua koneksi dibersihkan saat dimatikan.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Theme = require(script.Parent.Theme)
+
+local LocalPlayer = Players.LocalPlayer
+local Tools = {}
+
+local flyConn, noclipConn
+local spectateTarget, spectateConn
+local espConns, espHighlights = {}, {}
+
+local function character() return LocalPlayer.Character end
+
+-- ---------- Fly ----------
+function Tools.SetFly(on)
+	if flyConn then flyConn:Disconnect() flyConn = nil end
+	local char = character()
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then hum.PlatformStand = on end
+	if not on then
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+		return
+	end
+	flyConn = RunService.RenderStepped:Connect(function()
+		local c = character()
+		local hrp = c and c:FindFirstChild("HumanoidRootPart")
+		local cam = workspace.CurrentCamera
+		if not hrp or not cam then return end
+		local dir = Vector3.zero
+		if not UserInputService:GetFocusedTextBox() then
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+		end
+		hrp.AssemblyLinearVelocity = dir.Magnitude > 0 and dir.Unit * 70 or Vector3.zero
+	end)
+end
+
+-- ---------- Noclip ----------
+function Tools.SetNoclip(on)
+	if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+	if not on then return end
+	noclipConn = RunService.Stepped:Connect(function()
+		local c = character()
+		if not c then return end
+		for _, part in ipairs(c:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+		end
+	end)
+end
+
+-- ---------- Spectate ----------
+function Tools.StopSpectate()
+	if spectateConn then spectateConn:Disconnect() spectateConn = nil end
+	spectateTarget = nil
+	local cam = workspace.CurrentCamera
+	local hum = character() and character():FindFirstChildOfClass("Humanoid")
+	if cam and hum then cam.CameraSubject = hum end
+end
+
+function Tools.Spectate(userId)
+	Tools.StopSpectate()
+	local target = Players:GetPlayerByUserId(userId)
+	local hum = target and target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	spectateTarget = target
+	workspace.CurrentCamera.CameraSubject = hum
+	spectateConn = Players.PlayerRemoving:Connect(function(p)
+		if p == spectateTarget then Tools.StopSpectate() end
+	end)
+	return true
+end
+function Tools.IsSpectating() return spectateTarget ~= nil end
+
+-- ---------- ESP ----------
+local function removeHighlight(player)
+	local h = espHighlights[player]
+	if h then h:Destroy() espHighlights[player] = nil end
+end
+local function addHighlight(player)
+	removeHighlight(player)
+	if player == LocalPlayer or not player.Character then return end
+	local h = Instance.new("Highlight")
+	h.FillColor = Theme.accent
+	h.FillTransparency = 0.75
+	h.OutlineColor = Theme.good
+	h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	h.Parent = player.Character
+	espHighlights[player] = h
+end
+
+function Tools.SetESP(on)
+	for _, c in ipairs(espConns) do c:Disconnect() end
+	table.clear(espConns)
+	for p in pairs(espHighlights) do removeHighlight(p) end
+	if not on then return end
+	local function track(p)
+		addHighlight(p)
+		table.insert(espConns, p.CharacterAdded:Connect(function() task.wait(0.2) addHighlight(p) end))
+	end
+	for _, p in ipairs(Players:GetPlayers()) do track(p) end
+	table.insert(espConns, Players.PlayerAdded:Connect(track))
+	table.insert(espConns, Players.PlayerRemoving:Connect(removeHighlight))
+end
+
+function Tools.DisableAll()
+	Tools.SetFly(false)
+	Tools.SetNoclip(false)
+	Tools.StopSpectate()
+	Tools.SetESP(false)
+end
+
+return Tools
+]]></ProtectedString>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="RBX0037">
+        <Properties>
+          <string name="Name">UI</string>
+          <ProtectedString name="Source"><![CDATA[-- Komponen UI reusable yang dibuat 100% lewat script. Tween dikelola (tidak numpuk), koneksi lewat Maid.
+local TweenService = game:GetService("TweenService")
+local Theme = require(script.Parent.Theme)
+
+local UI = {}
+local activeTweens = setmetatable({}, { __mode = "k" }) -- [instance] = tween (weak: tidak menahan memori)
+
+function UI.New(class, props, children)
+	local inst = Instance.new(class)
+	local parent
+	for k, v in pairs(props or {}) do
+		if k == "Parent" then parent = v else inst[k] = v end
+	end
+	for _, c in ipairs(children or {}) do c.Parent = inst end
+	inst.Parent = parent
+	return inst
+end
+
+-- Satu tween aktif per instance: tween lama dibatalkan sebelum yang baru.
+function UI.Tween(inst, goal, info)
+	local old = activeTweens[inst]
+	if old then old:Cancel() end
+	local tw = TweenService:Create(inst, info or Theme.tween, goal)
+	activeTweens[inst] = tw
+	tw.Completed:Connect(function()
+		if activeTweens[inst] == tw then activeTweens[inst] = nil end
+		tw:Destroy()
+	end)
+	tw:Play()
+	return tw
+end
+
+function UI.Corner(r) return UI.New("UICorner", { CornerRadius = UDim.new(0, r or Theme.radius) }) end
+function UI.Stroke(color, t) return UI.New("UIStroke", { Color = color or Theme.stroke, Thickness = t or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }) end
+function UI.Pad(n) return UI.New("UIPadding", { PaddingTop = UDim.new(0, n), PaddingBottom = UDim.new(0, n), PaddingLeft = UDim.new(0, n), PaddingRight = UDim.new(0, n) }) end
+
+function UI.Frame(props, children)
+	local p = { BackgroundColor3 = Theme.panel, BorderSizePixel = 0 }
+	for k, v in pairs(props or {}) do p[k] = v end
+	local f = UI.New("Frame", p, children)
+	return f
+end
+
+function UI.Label(props)
+	local p = { BackgroundTransparency = 1, TextColor3 = Theme.text, Font = Theme.font, TextSize = Theme.size, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true }
+	for k, v in pairs(props or {}) do p[k] = v end
+	return UI.New("TextLabel", p)
+end
+
+-- Tombol dengan hover + debounce klik. onClick dipanggil di thread terpisah (boleh yield).
+function UI.Button(maid, props, onClick)
+	local base = props.BackgroundColor3 or Theme.panel2
+	local p = { BackgroundColor3 = base, TextColor3 = Theme.text, Font = Theme.font, TextSize = Theme.size, AutoButtonColor = false, BorderSizePixel = 0 }
+	for k, v in pairs(props) do p[k] = v end
+	local b = UI.New("TextButton", p, { UI.Corner(6) })
+	maid:Give(b.MouseEnter:Connect(function() UI.Tween(b, { BackgroundColor3 = base:Lerp(Color3.new(1, 1, 1), 0.12) }) end))
+	maid:Give(b.MouseLeave:Connect(function() UI.Tween(b, { BackgroundColor3 = base }) end))
+	local clicking = false
+	maid:Give(b.MouseButton1Click:Connect(function()
+		if clicking then return end
+		clicking = true
+		local ok, err = pcall(onClick)
+		if not ok then warn("[SmartAC UI]", err) end
+		clicking = false
+	end))
+	return b
+end
+
+function UI.Box(props)
+	local p = { BackgroundColor3 = Theme.bg, TextColor3 = Theme.text, PlaceholderColor3 = Theme.sub, Font = Theme.font, TextSize = Theme.size, ClearTextOnFocus = false, BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Left }
+	for k, v in pairs(props or {}) do p[k] = v end
+	return UI.New("TextBox", p, { UI.Corner(6), UI.Stroke(), UI.New("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+end
+
+function UI.Scroll(props)
+	local p = { BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarImageColor3 = Theme.stroke }
+	for k, v in pairs(props or {}) do p[k] = v end
+	return UI.New("ScrollingFrame", p, { UI.New("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }) })
+end
+
+-- Object pool sederhana untuk baris list yang sering di-refresh (hindari buat/hancurkan instance berulang).
+function UI.NewPool(create)
+	local free = {}
+	local pool = {}
+	function pool.Acquire() return table.remove(free) or create() end
+	function pool.Release(x) x.Parent = nil; table.insert(free, x) end
+	function pool.Destroy() for _, x in ipairs(free) do x:Destroy() end table.clear(free) end
+	return pool
+end
+
+return UI
+]]></ProtectedString>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="LocalScript" referent="RBX0038">
+      <Properties>
+        <string name="Name">Main</string>
+        <ProtectedString name="Source"><![CDATA[-- SmartAC client: report (semua pemain) + command bar & dashboard (hanya jika SERVER bilang lu staf).
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local Modules = script.Parent:WaitForChild("Modules")
+local Theme = require(Modules.Theme)
+local UI = require(Modules.UI)
+local Maid = require(Modules.Maid)
+local Notify = require(Modules.Notify)
+local ReportUI = require(Modules.ReportUI)
+local CommandBar = require(Modules.CommandBar)
+local Dashboard = require(Modules.Dashboard)
+local Tools = require(Modules.Tools)
+
+local REPORT_KEY = Enum.KeyCode.F3
+local DASH_KEY = Enum.KeyCode.F4
+local BAR_KEY = Enum.KeyCode.Semicolon
+
+local remotes = ReplicatedStorage:WaitForChild("SmartACRemotes", 30)
+if not remotes then warn("[SmartAC] Remote tidak ditemukan. Pastikan script server SmartAC aktif.") return end
+
+local gui = UI.New("ScreenGui", {
+	Name = "SmartACGui", ResetOnSpawn = false, IgnoreGuiInset = false, DisplayOrder = 100, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = Players.LocalPlayer:WaitForChild("PlayerGui"),
+})
+local maid = Maid.new()
+maid:Give(gui)
+
+local notify = Notify.new(gui, remotes:WaitForChild("Notify"))
+local report = ReportUI.new(gui, remotes:WaitForChild("SubmitReport"))
+local adminRemote = remotes:WaitForChild("Admin")
+local bar, dash = nil, nil
+local state = { fly = false, noclip = false, esp = false }
+
+-- Tombol kecil hanya di HP (sentuh); di PC cukup F3 / F4 / ;
+local buttons = UI.New("Frame", { Parent = gui, Visible = UserInputService.TouchEnabled, BackgroundTransparency = 1, Position = UDim2.new(0, 8, 0, 64), Size = UDim2.new(0, 250, 0, 30) }, {
+	UI.New("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }),
+})
+UI.Button(maid, { Parent = buttons, Text = "⚑ Report", Size = UDim2.new(0, 90, 1, 0), BackgroundColor3 = Theme.panel, TextSize = 12 }, function() report.Toggle() end)
+
+-- Aksi sisi-client yang DIMINTA server (fly/noclip/view/esp). Server sudah memberi izin; di sini hanya menjalankan.
+local function applyClientAction(a)
+	if a.kind == "fly" then state.fly = a.enabled == true; Tools.SetFly(state.fly)
+	elseif a.kind == "noclip" then state.noclip = a.enabled == true; Tools.SetNoclip(state.noclip)
+	elseif a.kind == "view" then Tools.Spectate(a.userId)
+	elseif a.kind == "unview" then Tools.StopSpectate()
+	elseif a.kind == "esp" then
+		if a.enabled == nil then state.esp = not state.esp else state.esp = a.enabled == true end
+		Tools.SetESP(state.esp)
+	end
+end
+
+task.spawn(function()
+	local ok, hello = pcall(function() return adminRemote:InvokeServer("hello", {}) end)
+	if not (ok and type(hello) == "table" and hello.ok and hello.role) then return end -- bukan staf: tidak ada UI admin sama sekali
+	local okC, cat = pcall(function() return adminRemote:InvokeServer("catalog", {}) end)
+	if not (okC and type(cat) == "table" and cat.ok) then return end
+
+	bar = CommandBar.new(gui, adminRemote, cat.commands, applyClientAction)
+	dash = Dashboard.new(gui, adminRemote, cat.commands, hello, bar)
+	UI.Button(maid, { Parent = buttons, Text = "🛡 Admin", Size = UDim2.new(0, 90, 1, 0), BackgroundColor3 = Theme.panel, TextSize = 12 }, function() dash.Toggle() end)
+	UI.Button(maid, { Parent = buttons, Text = "; Cmd", Size = UDim2.new(0, 60, 1, 0), BackgroundColor3 = Theme.panel, TextSize = 12 }, function() bar.Toggle() end)
+	notify.Toast("SmartAC", ("Admin aktif (%s). Tekan ; untuk command bar, F4 untuk dashboard."):format(hello.role), Theme.good, 5)
+
+	-- Saat respawn, matikan fly/noclip & sinkronkan ke server supaya state bypass anti-cheat tidak menggantung.
+	maid:Give(Players.LocalPlayer.CharacterAdded:Connect(function()
+		if state.fly then state.fly = false Tools.SetFly(false) task.spawn(function() adminRemote:InvokeServer("run", { text = "fly off" }) end) end
+		if state.noclip then state.noclip = false Tools.SetNoclip(false) task.spawn(function() adminRemote:InvokeServer("run", { text = "noclip off" }) end) end
+	end))
+end)
+
+maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or UserInputService:GetFocusedTextBox() then return end
+	if input.KeyCode == REPORT_KEY then report.Toggle()
+	elseif input.KeyCode == DASH_KEY and dash then dash.Toggle()
+	elseif input.KeyCode == BAR_KEY and bar then bar.Toggle() end
+end))
+]]></ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

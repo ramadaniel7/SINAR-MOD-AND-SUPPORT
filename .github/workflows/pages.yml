@@ -1,0 +1,45 @@
+name: Deploy dashboard (GitHub Pages)
+on:
+  push:
+    branches: [main]
+    paths: ["dashboard/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Pengaman: gagalkan build bila ada kunci RAHASIA di config.js (hanya kunci anon/publishable yang boleh publik).
+      - name: Cek config.js tidak berisi kunci rahasia
+        run: |
+          if grep -Eqi "service_role|sb_secret_|STAFF_API_KEY|ROBLOX_GATEWAY_KEY|SERVICE_ROLE" public/config.js; then
+            echo "::error::Kunci rahasia terdeteksi di public/config.js. Hapus dan rotate kunci tersebut."; exit 1; fi
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+        env:
+          PAGES_BASE_PATH: /${{ github.event.repository.name }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard/out
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

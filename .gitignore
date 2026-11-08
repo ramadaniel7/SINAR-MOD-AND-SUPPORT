@@ -1,0 +1,25 @@
+
+# Environment files - semua folder
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Tetap izinkan template environment
+!.env.example
+!**/.env.example
+
+# Dependencies - semua folder
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+build/
+.next/
+coverage/
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+.vscode/

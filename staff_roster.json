@@ -1,0 +1,137 @@
+{
+  "_catatan": "SATU-SATUNYA tempat daftar staff. Edit file ini lalu jalankan: python3 tools/build_all.py  (menghasilkan roblox/server/Roster.lua + supabase/staff_roster.sql). Role: founder, management, developer, administrator (=Admin), helper.",
+  "discord_role_ids": {
+    "founder": "1560622074949533736",
+    "management": "1561412416246521896",
+    "developer": "1561412474492821575",
+    "administrator": "1561412560132112545",
+    "helper": "1561412652096430281"
+  },
+  "roles": {
+    "founder": {
+      "roblox": [
+        {
+          "username": "bijibapakmuuuu",
+          "userId": 8269411613
+        },
+        {
+          "username": "asterveil_nr",
+          "userId": 11411678988
+        },
+        {
+          "username": "villainxxss",
+          "userId": 9188969905
+        }
+      ],
+      "discord": [
+        {
+          "id": "1462111697333518493",
+          "note": "Dans",
+          "email": "ramadnaieloktavianus76@gmail.com"
+          
+        },
+        {
+          "id": "1558438741918355523",
+          "note": "aster (akun lain)",
+          "email":"asterveilnarion@gmail.com"
+        },
+        {
+          "id": "1087381421129216060",
+          "note": "Villain"
+        }
+      ]
+    },
+    "management": {
+      "roblox": [
+        {
+          "username": "SagaraSkibidiw",
+          "userId": 8780518240
+        },
+        {
+          "username": "jarsss06",
+          "userId": 8850381377
+        }
+      ],
+      "discord": [
+        {
+          "id": "487307900998385686",
+          "note": "saga",
+          "email": "management@sinar.com"
+        },
+        {
+          "id": "797431604204142592",
+          "note": "pajar",
+          "email": "management1@sinar.com"
+        }
+      ]
+    },
+    "developer": {
+      "roblox": [],
+      "discord": []
+    },
+    "administrator": {
+      "roblox": [
+        {
+          "username": "lalalunna8",
+          "userId": 8841765649
+        },
+        {
+          "username": "Memor1es_10",
+          "userId": 1748614144
+        },
+        {
+          "username": "natnuy1",
+          "userId": 8901719751
+        },
+        {
+          "username": "aku_lunareal",
+          "userId": 7966279377
+        }
+      ],
+      "discord": [
+        {
+          "id": "1431703993909903432",
+          "note": "",
+          "email": "admin@sinar.com"
+
+        },
+        {
+          "id": "1513501984953471037",
+          "note": "",
+          "email": "admin1@sinar.com"
+        },
+        {
+          "id": "1409035962180173835",
+          "note": "",
+          "email": "admin2@sinar.com"
+        },
+        {
+          "id": "1483516730364920155",
+          "note": "",
+          "email": "admin3@sinar.com"
+        }
+      ]
+    },
+    "helper": {
+      "roblox": [
+        {
+          "username": "cyezvo",
+          "userId": 7530260164
+        }
+      ],
+      "discord": [
+        {
+          "id": "1298574784388534312",
+          "note": "",
+          "email": "helper1@sinar.com"
+
+        },
+        {
+          "id": "706087430570246167",
+          "note": "",
+          "email": "helper@sinar.com"
+        }
+      ]
+    }
+  }
+}
